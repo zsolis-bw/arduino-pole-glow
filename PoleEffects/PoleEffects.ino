@@ -3,275 +3,262 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_GPS.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
-#define DATA_PIN 17  // Pin connected to your external LED strip (if available)
-#define NUM_LEDS 34  // Adjust if using an external strip
+#define DATA_PIN 17
+#define NUM_LEDS 50
 #define BUTTON_PIN 0
 
-// Built-in NeoPixel LED pin for Adafruit QT Py ESP32-S2
+// Define GPS and MPU-6050 objects
+Adafruit_GPS GPS(&Wire);
+Adafruit_MPU6050 mpu;
+
+float currentSpeed = 0;
+float currentDirection = 0;
+uint8_t mode = 0;
+uint16_t hue = 0;
+bool isMaster = false;
+bool hasGPS = false;
+bool hasMPU = false;
+
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
+
 #ifdef PIN_NEOPIXEL
   #define BUILTIN_LED_PIN PIN_NEOPIXEL
   Adafruit_NeoPixel builtInLED = Adafruit_NeoPixel(1, BUILTIN_LED_PIN, NEO_GRB + NEO_KHZ800);
 #endif
 
-// Set up GPS using I2C (STEMMA QT port)
-Adafruit_GPS GPS(&Wire);
-
-// Simulated GPS variables
-float simulatedSpeed = 0;  // Simulated speed in MPH (0-10 range with bursts up to 20)
-float simulatedDirection = 0;  // Simulated direction (0-360 degrees)
-bool useSimulatedGPS = true;  // Toggle between simulated and real GPS data
-
-bool gReverseDirection = false;
-Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
-
-// Variables for effects
-uint8_t mode = 0;
-uint8_t sharedLEDColor[3] = {0, 0, 0}; // [Red, Green, Blue]
-uint16_t hue = 0;  // Global variable for hue (needed for rainbow effect)
-
-// Structure to hold the data for sending/receiving
 typedef struct {
   uint8_t mode;
-  uint8_t color[3];  // Shared LED color as RGB
-  uint16_t hue;      // Hue for rainbow effect
-  float speed;       // Speed for effects that depend on it
-  float direction;   // Direction for effects that depend on it
+  uint8_t color[3];
+  uint16_t hue;
+  float speed;
+  float direction;
 } LEDSyncData;
 
 LEDSyncData syncData;
 
-// MAC addresses of each board
-uint8_t sparkfunMac[] = {0x34, 0x98, 0x7A, 0x4C, 0xCA, 0x94};
-uint8_t qtPyMac[] = {0xD4, 0xF9, 0x8D, 0x66, 0x12, 0xCA};
-uint8_t *peerMac;  // Store the peer's MAC dynamically depending on which board is used
+// MAC addresses of ESP32 devices
+uint8_t board1Mac[] = {0xD4, 0xF9, 0x8D, 0x66, 0x12, 0xCA}; // "white" QT Py
+uint8_t board2Mac[] = {0xF4, 0x12, 0xFA, 0x59, 0x5B, 0x30}; // "black" QT Py
+
+uint8_t *macAddresses[] = {board1Mac, board2Mac};
+const int numBoards = 2;
 
 esp_now_peer_info_t peerInfo;
 
-// Function to determine if the device is SparkFun ESP32 Thing or QT Py ESP32-S2
-void determinePeerMac() {
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  if (memcmp(mac, sparkfunMac, 6) == 0) {
-    Serial.println("This is the SparkFun ESP32 Thing");
-    peerMac = qtPyMac;
-  } else if (memcmp(mac, qtPyMac, 6) == 0) {
-    Serial.println("This is the Adafruit QT Py ESP32-S2");
-    peerMac = sparkfunMac;
+// Initialize peer communication for all ESP32 devices
+void initializePeers() {
+  for (int i = 0; i < numBoards; i++) {
+    memcpy(peerInfo.peer_addr, macAddresses[i], 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("Failed to add peer");
+    }
+  }
+}
+
+// Attempt to initialize GPS and MPU sensors
+void initializeSensors() {
+  if (GPS.begin(0x10)) { // Check if GPS is present
+    hasGPS = true;
+    GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+    GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+    GPS.sendCommand(PGCMD_ANTENNA);
+  }
+  
+  if (mpu.begin()) { // Check if MPU is present
+    hasMPU = true;
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
   }
 }
 
 void setup() {
-  // Start serial communication
   Serial.begin(115200);
 
-  // Set up Wi-Fi in station mode for ESP-NOW
   WiFi.mode(WIFI_STA);
-
-  // Wait for Wi-Fi adapter to be ready
   delay(1000);
 
-  // Determine which device we're on
-  determinePeerMac();
-
-  // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
     return;
   }
 
-  // Register peer
-  memcpy(peerInfo.peer_addr, peerMac, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-
-  // Add peer
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add peer");
-    return;
-  }
-
-  // Register send and receive callbacks
+  initializePeers();
   esp_now_register_send_cb(onDataSent);
   esp_now_register_recv_cb(onDataRecv);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
+  strip.begin();
+  strip.setBrightness(50);
+  strip.show();
+
   #ifdef PIN_NEOPIXEL
-    // Initialize built-in NeoPixel for Adafruit QT Py ESP32-S2
     pinMode(NEOPIXEL_POWER, OUTPUT);
-    digitalWrite(NEOPIXEL_POWER, HIGH); // Enable NeoPixel power
+    digitalWrite(NEOPIXEL_POWER, HIGH);
     builtInLED.begin();
-    builtInLED.show();  // Turn off initially
+    builtInLED.show();
   #endif
 
-  // Initialize external LED strip (if available)
-  strip.begin();
-  strip.show();  // Initialize all pixels to 'off'
-
-  // Initialize the GPS (real data can replace simulated when connected)
-  GPS.begin(0x10);  // I2C address for PA1010D GPS
-  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
-  GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);  // 1 Hz update rate
-  GPS.sendCommand(PGCMD_ANTENNA);
-
+  initializeSensors();
   delay(1000);
 }
 
 void loop() {
-  // Simulate GPS data or read from GPS module
-  if (useSimulatedGPS) {
-    simulateGPSData();
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    // Increment mode and send to other boards
+    mode = (mode + 1) % 6;
+    syncData.mode = mode;
+    syncData.hue = hue;
+
+    // Update the LED color for the mode
+    setLEDColorForMode(mode);
+
+    // Broadcast the new mode to all peers
+    esp_now_send(nullptr, (uint8_t *)&syncData, sizeof(syncData));
+    delay(200); // Debounce
+  }
+
+  // Set master based on sensor needs and available sensors
+  if ((modeRequiresGPS() && hasGPS) || (modeRequiresMPU() && hasMPU)) {
+    isMaster = true;
+    readSensorData();
+    syncData.speed = currentSpeed;
+    syncData.direction = currentDirection;
+    
+    // Periodically send sensor data to other boards
+    esp_now_send(nullptr, (uint8_t *)&syncData, sizeof(syncData));
   } else {
+    isMaster = false; // Not master if no relevant sensor for the mode
+  }
+
+  applyEffectToStrip();
+  delay(20);
+}
+
+// --- Sensor Data Functions ---
+void readSensorData() {
+  if (hasGPS) {
     readGPSData();
   }
-
-  // Check for button press to change mode
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    mode = (mode + 1) % 6;  // Cycle through modes
-    delay(200);  // Debounce delay
-
-    // Update the sync data and broadcast to the other device
-    syncData.mode = mode;
-    syncData.hue = hue;       // Sync the hue for effects like rainbow
-    syncData.speed = simulatedSpeed;     // Sync the speed
-    syncData.direction = simulatedDirection;  // Sync direction
-    setLEDColorForMode(mode); // Set the appropriate LED color for the new mode
-    memcpy(syncData.color, sharedLEDColor, sizeof(sharedLEDColor));  // Share LED color
-    esp_now_send(peerMac, (uint8_t *)&syncData, sizeof(syncData));
-  }
-
-  // Display the shared LED color on the built-in LED (if available)
-  #ifdef PIN_NEOPIXEL
-    builtInLED.setPixelColor(0, builtInLED.Color(sharedLEDColor[0], sharedLEDColor[1], sharedLEDColor[2]));
-    builtInLED.show();
-  #endif
-
-  // Apply the effect to the LED strip
-  applyEffectToStrip();
-
-  delay(20);  // Slight delay to slow down the effect speed
-}
-
-// --- LED Color and Effect Functions ---
-void setLEDColorForMode(uint8_t mode) {
-  switch (mode) {
-    case 0:
-      sharedLEDColor[0] = 255; sharedLEDColor[1] = 0; sharedLEDColor[2] = 0;  // Red
-      break;
-    case 1:
-      sharedLEDColor[0] = 0; sharedLEDColor[1] = 255; sharedLEDColor[2] = 0;  // Green
-      break;
-    case 2:
-      sharedLEDColor[0] = 0; sharedLEDColor[1] = 0; sharedLEDColor[2] = 255;  // Blue
-      break;
-    case 3:
-      sharedLEDColor[0] = 255; sharedLEDColor[1] = 255; sharedLEDColor[2] = 0;  // Yellow
-      break;
-    case 4:
-      sharedLEDColor[0] = 0; sharedLEDColor[1] = 255; sharedLEDColor[2] = 255;  // Cyan
-      break;
-    case 5:
-      sharedLEDColor[0] = 255; sharedLEDColor[1] = 0; sharedLEDColor[2] = 255;  // Magenta
-      break;
-    default:
-      sharedLEDColor[0] = 255; sharedLEDColor[1] = 255; sharedLEDColor[2] = 255;  // White
-      break;
+  if (hasMPU) {
+    readGyroData();
   }
 }
 
-void applyEffectToStrip() {
-  switch (mode) {
-    case 0:
-      turnOffLEDs();
-      break;
-    case 1:
-      scrollingRainbow();  // Scrolling rainbow effect based on hue and speed
-      break;
-    case 2:
-      directionalStrobe();  // Pop effect based on sharp direction changes
-      break;
-    case 3:
-      cometTail();  // Comet effect with length adjusting based on speed
-      break;
-    case 4:
-      twinkleBurst();  // Twinkle bursts that increase with speed
-      break;
-    case 5:
-      breathingEffect();  // Breathing light effect based on speed
-      break;
-  }
-  strip.show();
-}
-
-void turnOffLEDs() {
-  strip.clear();  // Turn off external LED strip
-}
-
-void scrollingRainbow() {
-  // Example scrolling rainbow effect
-  uint16_t speedFactor = 10 + (uint16_t)(syncData.speed * 50);  // Speed scales between slow (~10) to fast (~60)
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint32_t color = strip.ColorHSV((syncData.hue + (i * 65536L / NUM_LEDS)) % 65536, 255, 255);
-    strip.setPixelColor(i, color);
-  }
-  syncData.hue += speedFactor;
-  if (syncData.hue >= 65536) syncData.hue -= 65536;
-}
-
-void directionalStrobe() {
-  // Example directional strobe effect (pop effect)
-  strip.clear();
-  if (abs(simulatedDirection - syncData.direction) > 30) {
-    for (int i = 0; i < NUM_LEDS; i++) {
-      strip.setPixelColor(i, strip.Color(255, 255, 255));  // White flash
+void readGPSData() {
+  while (GPS.available()) {
+    GPS.read();
+    if (GPS.fix) {
+      currentSpeed = GPS.speed * 1.15078; // Convert knots to MPH
+      Serial.print("Speed: "); Serial.println(currentSpeed);
     }
   }
 }
 
+void readGyroData() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  currentDirection = g.gyro.z * 57.2958; // Convert radians/s to degrees/s
+  Serial.print("Direction: "); Serial.println(currentDirection);
+}
+
+// --- Mode Requirements ---
+bool modeRequiresGPS() { return (mode == 1 || mode == 3); }
+bool modeRequiresMPU() { return (mode == 2 || mode == 4); }
+
+// --- LED Color and Effect Functions ---
+void setLEDColorForMode(uint8_t mode) {
+  switch (mode) {
+    case 0: sharedLEDColor(255, 0, 0); break;
+    case 1: sharedLEDColor(0, 255, 0); break;
+    case 2: sharedLEDColor(0, 0, 255); break;
+    case 3: sharedLEDColor(255, 255, 0); break;
+    case 4: sharedLEDColor(0, 255, 255); break;
+    case 5: sharedLEDColor(255, 0, 255); break;
+    default: sharedLEDColor(255, 255, 255); break;
+  }
+}
+
+void sharedLEDColor(uint8_t r, uint8_t g, uint8_t b) {
+  syncData.color[0] = r;
+  syncData.color[1] = g;
+  syncData.color[2] = b;
+  #ifdef PIN_NEOPIXEL
+    builtInLED.setPixelColor(0, builtInLED.Color(r, g, b));
+    builtInLED.show();
+  #endif
+}
+
+void applyEffectToStrip() {
+  switch (mode) {
+    case 0: strip.clear(); break;
+    case 1: scrollingRainbow(); break;
+    case 2: directionalStrobe(); break;
+    case 3: cometTail(); break;
+    case 4: twinkleBurst(); break;
+    case 5: breathingEffect(); break;
+  }
+  strip.show();
+}
+
+// --- Effects ---
+
+void scrollingRainbow() {
+  uint16_t speedFactor = 10 + (uint16_t)(currentSpeed * 50);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    uint32_t color = strip.ColorHSV((hue + (i * 65536L / NUM_LEDS)) % 65536, 255, 255);
+    strip.setPixelColor(i, color);
+  }
+  hue += speedFactor;
+  if (hue >= 65536) hue -= 65536;
+}
+
+void directionalStrobe() {
+  uint8_t brightness = (sin(millis() / 200.0) * 127) + 128;
+  for (int i = 0; i < NUM_LEDS; i++) {
+    int position = (i + (int)(currentDirection / 10)) % NUM_LEDS;
+    strip.setPixelColor(position, strip.Color(255, 255, 255, brightness));
+  }
+}
+
 void cometTail() {
-  // Example comet effect
+  static int cometPos = 0;
   strip.clear();
-  static uint16_t cometIndex = 0;
-  cometIndex = (cometIndex + 1) % NUM_LEDS;
-  strip.setPixelColor(cometIndex, strip.Color(255, 255, 255));
+  int tailLength = 5;
+  for (int i = 0; i < tailLength; i++) {
+    int pos = (cometPos - i + NUM_LEDS) % NUM_LEDS;
+    uint8_t brightness = 255 - (i * 50);
+    strip.setPixelColor(pos, strip.Color(255, 0, 0, brightness));
+  }
+  cometPos = (cometPos + 1) % NUM_LEDS;
 }
 
 void twinkleBurst() {
-  // Example twinkle effect
   strip.clear();
-  for (int i = 0; i < 5; i++) {
-    strip.setPixelColor(random(NUM_LEDS), strip.Color(255, 255, 255));
+  for (int i = 0; i < NUM_LEDS / 4; i++) {
+    int pos = random(NUM_LEDS);
+    strip.setPixelColor(pos, strip.Color(random(255), random(255), random(255)));
   }
+  delay(50);
 }
 
 void breathingEffect() {
-  // Example breathing effect
-  static uint8_t brightness = 0;
-  brightness = (brightness + 1) % 256;
+  uint8_t brightness = (sin(millis() / 1000.0 * PI) * 127) + 128;
   for (int i = 0; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, strip.Color(0, 255, 0, brightness));  // Green breathing
+    strip.setPixelColor(i, strip.Color(0, 0, 255, brightness));
   }
-}
-
-// --- Simulated and Real GPS Data Functions ---
-void simulateGPSData() {
-  // Simulate speed and direction changes for testing
-  simulatedSpeed = random(0, 11) + (random(0, 5) == 0 ? random(0, 10) : 0);  // Random speed with occasional burst
-  simulatedDirection = random(0, 361);  // Random direction between 0 and 360 degrees
-}
-
-void readGPSData() {
-  // Read actual GPS data from the PA1010D module (if connected)
-  GPS.read();
-  if (GPS.newNMEAreceived()) {
-    GPS.parse(GPS.lastNMEA());
-    simulatedSpeed = GPS.speed * 1.15078;  // Convert from knots to MPH
-    simulatedDirection = GPS.angle;  // GPS course angle
-  }
+  delay(20);
 }
 
 // --- ESP-NOW Callbacks ---
+
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   Serial.print("Last Packet Send Status: ");
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
@@ -280,6 +267,10 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 void onDataRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *incomingData, int len) {
   memcpy(&syncData, incomingData, sizeof(syncData));
   mode = syncData.mode;
-  memcpy(sharedLEDColor, syncData.color, sizeof(sharedLEDColor));  // Sync LED color from received data
-  Serial.println("Syncing LED strip...");
+  hue = syncData.hue;
+  currentSpeed = syncData.speed;
+  currentDirection = syncData.direction;
+
+  // Sync LED color based on mode
+  sharedLEDColor(syncData.color[0], syncData.color[1], syncData.color[2]);
 }
