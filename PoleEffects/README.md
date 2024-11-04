@@ -9,13 +9,19 @@ The PoleEffects project is a multi-device PlatformIO-based setup for synchronize
 - Uses GPS data to control LED effects like scrolling rainbow speed.
 - Incorporates accelerometer data for direction-based effects.
 
-## Hardware Requirements
-- Two or more ESP32 boards (e.g., Adafruit QT Py ESP32-S2/S3)
-- WS2812 or similar LED strips
-- Adafruit Mini GPS PA1010D
-- Adafruit MPU-6050 6-DoF Accelerometer and Gyro Sensor
-- PowerBoost 1000C for battery management (optional but recommended)
-- 3.7V LiPo battery for portable power
+## Dev Kit Hardware
+- [Adafruit PowerBoost 1000 Charger](https://www.adafruit.com/product/2465)
+  - Can charge the LiPo battery and boost the voltage to the 5v needed for the LED strips
+- [Adafruit QT Py ESP32](https://www.adafruit.com/product/2465)
+  - Any ESP32 will work, but these are compact and support STEMMA QT for adding sensors easily
+- [Adafruit Mini GPS](https://www.adafruit.com/product/4415)
+  - Compact GPS sensor
+- [Adafruit Accel and Gyro Sensor](https://www.adafruit.com/product/3886)
+  - The more basic of the accelerometer sensors with only 6 degrees of freedom
+- [Adafruit LiPo 2000mAh Battery](https://www.adafruit.com/product/2011)
+  - Any 2000mAh 3.7v battery will be supported on this kit
+- [Adafruit STEMMA QT / Qwiic JST SH 4-Pin Cable](https://www.adafruit.com/product/4399)
+  - One for each sensor in the system
 
 ## Software Requirements
 - [VS Code](https://code.visualstudio.com/)
