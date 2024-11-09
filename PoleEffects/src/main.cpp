@@ -9,7 +9,9 @@
 
 #define DATA_PIN 17
 #define NUM_LEDS 50
-#define BUTTON_PIN 0
+#define BUTTON_PINS {0, 18} // Array of GPIO pins to use for buttons
+const int buttonPins[] = BUTTON_PINS; // Array to store button pins
+const int numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]); // Calculate number of buttons
 
 // Define GPS and MPU-6050 objects
 Adafruit_GPS GPS(&Wire);
@@ -94,7 +96,9 @@ void setup() {
   esp_now_register_send_cb(onDataSent);
   esp_now_register_recv_cb(onDataRecv);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  for (int i = 0; i < numberOfButtons; i++) {
+    pinMode(buttonPins[i], INPUT_PULLUP);
+  }
 
   strip.begin();
   strip.setBrightness(50);
@@ -125,13 +129,15 @@ void setup() {
 }
 
 void loop() {
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    mode = (mode + 1) % 6;
-    syncData.mode = mode;
-    syncData.hue = hue;
-    esp_now_send(nullptr, (uint8_t *)&syncData, sizeof(syncData));
-    setLEDColorForMode(mode);
-    delay(200);
+  // Check all button pins
+  for (int i = 0; i < numberOfButtons; i++) {
+    if (digitalRead(buttonPins[i]) == LOW) { // Button press detected
+      mode = (mode + 1) % 6; // Change mode
+      syncData.mode = mode; // Update mode data
+      esp_now_send(nullptr, (uint8_t *)&syncData, sizeof(syncData)); // Sync mode
+      setLEDColorForMode(mode); // Set the LED color for the mode
+      delay(200); // Debounce delay
+    }
   }
 
   if ((modeRequiresGPS() && hasGPS) || (modeRequiresMPU() && hasMPU)) {
