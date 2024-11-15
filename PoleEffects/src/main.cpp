@@ -295,14 +295,21 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+  // Update sync data with received data
   memcpy(&syncData, incomingData, sizeof(syncData));
+
+  // Update mode, hue, speed, and direction on the current device
   mode = syncData.mode;
   hue = syncData.hue;
   currentSpeed = syncData.speed;
   currentDirection = syncData.direction;
 
+  // Update LED color and effect for the current device
   setLEDColorForMode(syncData.mode);
   sharedLEDColor(syncData.color[0], syncData.color[1], syncData.color[2]);
+
+  // Broadcast the updated sync data to all devices
+  esp_now_send(nullptr, (uint8_t *)&syncData, sizeof(syncData));
 }
 
 void sharedLEDColor(uint8_t r, uint8_t g, uint8_t b) {
