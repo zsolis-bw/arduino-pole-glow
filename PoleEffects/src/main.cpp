@@ -10,8 +10,11 @@
 #define DATA_PIN 17
 #define NUM_LEDS 50
 #define BUTTON_PINS {0, 18} // Array of GPIO pins to use for buttons
-#define DEBUG_MODE true // Toggle to enable or disable debug mode
-#define DEBUG_FUNCTIONS {"GPS_SPEED", "GPS_LOC", "GYRO_XYZ"} // List of functions to monitor TO-DO: Implement
+#define DEBUG_MODE true
+
+// Define an array of debug functions (options "GPS_SPEED", "GPS_LOC", "GPS_ELEV", "GYRO_XYZ", "GYRO_ACCEL")
+String DEBUG_FUNCTIONS[] = {"GPS_LOC","GPS_ELEV"};
+const int DEBUG_FUNCTIONS_SIZE = sizeof(DEBUG_FUNCTIONS) / sizeof(DEBUG_FUNCTIONS[0]);
 
 const int buttonPins[] = BUTTON_PINS;
 const int numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
@@ -22,6 +25,11 @@ Adafruit_MPU6050 mpu;
 
 float currentSpeed = 0;
 float currentDirection = 0;
+float gpsLatitude = 0.0;
+float gpsLongitude = 0.0;
+float gpsElevation = 0.0;
+unsigned long lastGPSUpdate = 0;
+const unsigned long gpsUpdateInterval = 1000; // Update GPS every 1000 ms
 uint8_t mode = 0;
 uint16_t hue = 0;
 bool isMaster = false;
@@ -53,9 +61,6 @@ uint8_t macAddresses[][6] = {
 
 esp_now_peer_info_t peerInfo;
 
-// Debug functions array
-const char* debugFunctions[] = DEBUG_FUNCTIONS;
-
 // Forward declarations for functions
 void initializePeers();
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
@@ -74,7 +79,7 @@ void twinkleBurst();
 void breathingEffect();
 void gyroRainbowEffect();
 void sharedLEDColor(uint8_t r, uint8_t g, uint8_t b);
-void debugOutput(const char* function);
+void debugOutput(String functions[], int numFunctions);
 
 // Initialize peer communication for all ESP32 devices
 void initializePeers() {
@@ -120,20 +125,19 @@ void setup() {
         builtInLED.show();
     #endif
 
-    // Custom I2C pin configuration
+    // Custom I2C pin configuration (very stupid, all of these parts are Adafruit and I shouldn't have to specify)
     Wire.begin(41, 40); // Set SDA to GPIO 41 and SCL to GPIO 40
 
-    // Only initialize the GPS if this device is supposed to have one
-    if (hasGPS) {
-        if (GPS.begin(0x10)) {
-            GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
-            GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
-            GPS.sendCommand(PGCMD_ANTENNA);
-            Serial.println("GPS initialized successfully.");
-        } else {
-            Serial.println("Failed to initialize GPS.");
-            hasGPS = false;
-        }
+    // Only initialize the GPS if this device is supposed to have one (skip MPU device as hack for now)
+    if (GPS.begin(0x10)) { // Replace 0x10 with the correct address if needed
+      hasGPS = true;
+      Serial.println("GPS initialized successfully!");
+      // Send configuration commands
+      GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+      GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+      GPS.sendCommand(PGCMD_ANTENNA);
+    } else {
+      Serial.println("Failed to initialize GPS.");
     }
 
     // Only initialize the MPU-6050 if this device is supposed to have one
@@ -176,27 +180,57 @@ void loop() {
 
     applyEffectToStrip();
     delay(20);
+
+    if (DEBUG_MODE){
+      debugOutput(DEBUG_FUNCTIONS, DEBUG_FUNCTIONS_SIZE);
+    }
 }
 
 // Debug function to output sensor information selectively
-void debugOutput(const char* function) {
-  if (strcmp(function, "GPS_SPEED") == 0 && hasGPS) {
-    Serial.print("Current Speed: ");
-    Serial.println(currentSpeed);
-  }
-  if (strcmp(function, "GPS_LOC") == 0 && hasGPS) {
-    // Add more GPS-specific debug output if needed
-    Serial.println("Debugging GPS Location...");
-  }
-  if (strcmp(function, "GYRO_XYZ") == 0 && hasMPU) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    Serial.print("Gyro X: ");
-    Serial.print(g.gyro.x);
-    Serial.print(" rad/s, Y: ");
-    Serial.print(g.gyro.y);
-    Serial.print(" rad/s, Z: ");
-    Serial.println(g.gyro.z);
+void debugOutput(String functions[], int numFunctions) {
+  // Loop through each function name in the array
+  for (int i = 0; i < numFunctions; i++) {
+    if (functions[i] == "GPS_SPEED" && hasGPS) {
+      Serial.print("Current Speed: ");
+      Serial.println(currentSpeed);
+      delay(1000);
+    }
+    if (functions[i] == "GPS_LOC" && hasGPS) {
+      // Capture and output GPS location data
+      Serial.print("Latitude: ");
+      Serial.println(GPS.latitudeDegrees);
+      Serial.print("Longitude: ");
+      Serial.println(GPS.longitudeDegrees);
+      delay(1000);
+    }
+    if (functions[i] == "GPS_ELEV" && hasGPS) {
+      // Capture and output GPS elevation data
+      Serial.print("Elevation: ");
+      Serial.println(GPS.altitude);
+      delay(1000);
+    }
+    if (functions[i] == "GYRO_XYZ" && hasMPU) {
+      sensors_event_t a, g, temp;
+      mpu.getEvent(&a, &g, &temp);
+      Serial.print("Gyro X: ");
+      Serial.print(g.gyro.x);
+      Serial.print(" rad/s, Y: ");
+      Serial.print(g.gyro.y);
+      Serial.print(" rad/s, Z: ");
+      Serial.println(g.gyro.z);
+      delay(1000);
+    }
+    if (functions[i] == "GYRO_ACCEL" && hasMPU) {
+      sensors_event_t a, g, temp;
+      mpu.getEvent(&a, &g, &temp);
+      Serial.print("Accel X: ");
+      Serial.print(a.acceleration.x);
+      Serial.print(", Y: ");
+      Serial.print(a.acceleration.y);
+      Serial.print(", Z: ");
+      Serial.println(a.acceleration.z);
+      delay(1000); 
+    }
   }
 }
 
@@ -213,12 +247,17 @@ void readSensorData() {
 }
 
 void readGPSData() {
-    while (GPS.available()) {
-        GPS.read();
-        if (GPS.fix) {
-            currentSpeed = GPS.speed * 1.15078;
-        }
-    }
+      while (GPS.available()) {
+      GPS.read();
+      if (GPS.fix && (millis() - lastGPSUpdate >= gpsUpdateInterval)) {
+          Serial.print("Fix acquired!");
+          lastGPSUpdate = millis();
+          currentSpeed = GPS.speed * 1.15078; // Convert knots to mph
+          gpsLatitude = GPS.latitudeDegrees;
+          gpsLongitude = GPS.longitudeDegrees;
+          gpsElevation = GPS.altitude;
+      }
+  }
 }
 
 void readGyroData() {
@@ -227,16 +266,6 @@ void readGyroData() {
 
     // Ensure we are capturing gyro values in degrees per second
     currentDirection = g.gyro.z * 57.2958; // Convert radians to degrees
-
-    if (DEBUG_MODE) {
-        // Print gyro data for debugging purposes
-        Serial.print("Gyro X: ");
-        Serial.print(g.gyro.x * 57.2958);
-        Serial.print(" deg/s, Y: ");
-        Serial.print(g.gyro.y * 57.2958);
-        Serial.print(" deg/s, Z: ");
-        Serial.println(g.gyro.z * 57.2958);
-    }
 }
 
 // --- Mode Requirements ---
@@ -375,23 +404,6 @@ void gyroRainbowEffect() {
   float yAccel = accel.acceleration.y;
   float zAccel = accel.acceleration.z;
 
-  // Debug output for sensor readings
-  if (DEBUG_MODE) {
-    Serial.print("Gyro X: ");
-    Serial.print(xRotation);
-    Serial.print(", Y: ");
-    Serial.print(yRotation);
-    Serial.print(", Z: ");
-    Serial.println(zRotation);
-
-    Serial.print("Accel X: ");
-    Serial.print(xAccel);
-    Serial.print(", Y: ");
-    Serial.print(yAccel);
-    Serial.print(", Z: ");
-    Serial.println(zAccel);
-  }
-
   // Normalize the values to a 0-65535 range for hue
   uint16_t hueX = (uint16_t)(abs(xRotation) * 100) % 65536;
   uint16_t hueY = (uint16_t)(abs(yRotation) * 100) % 65536;
@@ -403,12 +415,6 @@ void gyroRainbowEffect() {
 
   // Combine all hues
   uint16_t combinedHue = (hueX + hueY + hueZ + accelHueX + accelHueY + accelHueZ) / 6;
-
-  // Debug combined hue
-  if (DEBUG_MODE) {
-    Serial.print("Combined Hue: ");
-    Serial.println(combinedHue);
-  }
 
   // Set the color across the LED strip using the combined hue
   for (int i = 0; i < NUM_LEDS; i++) {
