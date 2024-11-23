@@ -14,12 +14,12 @@ The PoleEffects project is a multi-device PlatformIO-based setup for synchronize
   - Can charge the LiPo battery and boost the voltage to the 5v needed for the LED strips
 - [Adafruit QT Py ESP32](https://www.adafruit.com/product/2465)
   - Any ESP32 will work, but these are compact and support STEMMA QT for adding sensors easily
-- [Adafruit Mini GPS](https://www.adafruit.com/product/4415)
+- ~~[Adafruit Mini GPS](https://www.adafruit.com/product/4415)~~ [Beitan BE-180 GPS Module](https://www.amazon.com/Geekstory-AntennaTTL-38400bps-Raspberry-Controller/dp/B0BV5TGFD4?th=1)
   - Compact GPS sensor
 - [Adafruit Accel and Gyro Sensor](https://www.adafruit.com/product/3886)
   - The more basic of the accelerometer sensors with only 6 degrees of freedom
 - [Adafruit LiPo 2000mAh Battery](https://www.adafruit.com/product/2011)
-  - Any 2000mAh 3.7v battery will be supported on this kit
+  - Any 3.7v battery will be supported on this kit, the 2000MaH seems to be a good balance of size/life
 - [Adafruit STEMMA QT / Qwiic JST SH 4-Pin Cable](https://www.adafruit.com/product/4399)
   - One for each sensor in the system
 

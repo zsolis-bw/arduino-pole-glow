@@ -3,449 +3,584 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <Adafruit_GPS.h>
+#include <TinyGPSPlus.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include "esp_log.h"
+#include <unordered_map>
+#include <string>
+#include <iostream>
 
+// Pin and hardware definitions
 #define DATA_PIN 17
 #define NUM_LEDS 50
 #define BUTTON_PINS {0, 18} // Array of GPIO pins to use for buttons
 #define DEBUG_MODE true
 
-// Define an array of debug functions (options "GPS_SPEED", "GPS_LOC", "GPS_ELEV", "GYRO_XYZ", "GYRO_ACCEL")
-String DEBUG_FUNCTIONS[] = {"GPS_LOC","GPS_ELEV"};
-const int DEBUG_FUNCTIONS_SIZE = sizeof(DEBUG_FUNCTIONS) / sizeof(DEBUG_FUNCTIONS[0]);
+// List debug functions and their enabled status
+std::unordered_map<std::string, bool> debugFunctions = {
+    {"GPS_SPEED", true},
+    {"GPS_LOC", true},
+    {"GPS_ELEV", true},
+    {"GPS_SATS", true},
+    {"GYRO_XYZ", true},
+    {"GYRO_ACCEL", true},
+    {"MEMORY_SYNC", false}
+};
 
 const int buttonPins[] = BUTTON_PINS;
 const int numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
 
-// Define GPS and MPU-6050 objects
-Adafruit_GPS GPS(&Wire);
+// GPS Pins and Baud Rate
+#define RXPin 41  // GPS TX -> ESP RX
+#define TXPin 40  // GPS RX -> ESP TX
+#define GPSBaud 38400
+
+// GPS and MPU objects
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1); // Use Serial1 for GPS
 Adafruit_MPU6050 mpu;
 
+// GPS data variables
 float currentSpeed = 0;
-float currentDirection = 0;
 float gpsLatitude = 0.0;
 float gpsLongitude = 0.0;
 float gpsElevation = 0.0;
+unsigned int gpsSatellites = 0;
+float gpsHDOP = 0.0;
+
+// MPU data variables
+float currentDirection = 0;
+float accelX = 0.0;
+float accelY = 0.0;
+float accelZ = 0.0;
+float gyroX = 0.0;
+float gyroY = 0.0;
+float gyroZ = 0.0;
+
+// Other variables
 unsigned long lastGPSUpdate = 0;
 const unsigned long gpsUpdateInterval = 1000; // Update GPS every 1000 ms
 uint8_t mode = 0;
 uint16_t hue = 0;
-bool isMaster = false;
 bool hasGPS = false;
 bool hasMPU = false;
+bool isMaster = false;
 
+// NeoPixel and ESP-NOW structures
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
 
 #ifdef PIN_NEOPIXEL
-  #define BUILTIN_LED_PIN PIN_NEOPIXEL
-  Adafruit_NeoPixel builtInLED = Adafruit_NeoPixel(1, BUILTIN_LED_PIN, NEO_GRB + NEO_KHZ800);
+#define BUILTIN_LED_PIN PIN_NEOPIXEL
+Adafruit_NeoPixel builtInLED = Adafruit_NeoPixel(1, BUILTIN_LED_PIN, NEO_GRB + NEO_KHZ800);
 #endif
 
-typedef struct {
-  uint8_t mode;
-  uint8_t color[3];
-  uint16_t hue;
-  float speed;
-  float direction;
+typedef struct __attribute__((packed)) {
+    uint16_t speed;          // Scaled to tenths of mph
+    int16_t direction;       // Scaled to tenths of degrees
+    int16_t elevation;       // Scaled to meters
+} GPSData;
+
+typedef struct __attribute__((packed)) {
+    int16_t accelX;          // Scaled to milli-g
+    int16_t accelY;          // Scaled to milli-g
+    int16_t accelZ;          // Scaled to milli-g
+    int16_t gyroX;           // Scaled to tenths of degrees/sec
+    int16_t gyroY;           // Scaled to tenths of degrees/sec
+    int16_t gyroZ;           // Scaled to tenths of degrees/sec
+} MPUData;
+
+typedef struct __attribute__((packed)) {
+    uint8_t mode;            // Current mode
+    uint8_t color[3];        // RGB color data
+    uint16_t hue;            // Hue for effects
+    GPSData gpsData;         // GPS-specific data
+    MPUData mpuData;         // MPU-specific data
+    uint8_t hasGPS;          // Flags to indicate ownership
+    uint8_t hasMPU;
 } LEDSyncData;
 
 LEDSyncData syncData;
 
-// MAC addresses of all ESP32 devices
+unsigned long lastGPSSendTime = 0;
+unsigned long lastMPUSendTime = 0;
+
+const unsigned long gpsSendInterval = 200; // 200ms
+const unsigned long mpuSendInterval = 500; // 500ms
+
+// Array of peer MAC addresses (replace with actual MAC addresses of devices)
 uint8_t macAddresses[][6] = {
-  {0xD4, 0xF9, 0x8D, 0x66, 0x12, 0xCA},
-  {0xF4, 0x12, 0xFA, 0x59, 0x5B, 0x30}
+    {0xD4, 0xF9, 0x8D, 0x66, 0x12, 0xCA}, // Replace with your first ESP32 MAC
+    {0xF4, 0x12, 0xFA, 0x59, 0x5B, 0x30}  // Replace with your second ESP32 MAC
 };
+
+uint8_t selfMac[6];      // This device's MAC address
+uint8_t oppositeMac[6];  // The opposite device's MAC address
 
 esp_now_peer_info_t peerInfo;
 
-// Forward declarations for functions
-void initializePeers();
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
-void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
-void setLEDColorForMode(uint8_t mode);
-void applyEffectToStrip();
-void readSensorData();
+void initializePeers() {
+    for (int i = 0; i < sizeof(macAddresses) / sizeof(macAddresses[0]); i++) {
+        memcpy(peerInfo.peer_addr, macAddresses[i], 6);
+        peerInfo.channel = 0; // Use default channel
+        peerInfo.encrypt = false; // No encryption for now
+
+        if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+            Serial.printf("Failed to add peer: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                          macAddresses[i][0], macAddresses[i][1], macAddresses[i][2],
+                          macAddresses[i][3], macAddresses[i][4], macAddresses[i][5]);
+        } else {
+            Serial.printf("Added peer: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                          macAddresses[i][0], macAddresses[i][1], macAddresses[i][2],
+                          macAddresses[i][3], macAddresses[i][4], macAddresses[i][5]);
+        }
+    }
+}
+
+// Forward declarations
+void debugOutput();
+bool isDebugFunctionEnabled(const std::string& functionName);
 void readGPSData();
 void readGyroData();
-bool modeRequiresGPS();
-bool modeRequiresMPU();
+void initializeGPS();
+void initializeMPU();
+void applyEffectToStrip();
+void setLEDColorForMode(uint8_t mode);
 void scrollingRainbow();
 void directionalStrobe();
 void cometTail();
 void twinkleBurst();
 void breathingEffect();
 void gyroRainbowEffect();
-void sharedLEDColor(uint8_t r, uint8_t g, uint8_t b);
-void debugOutput(String functions[], int numFunctions);
-
-// Initialize peer communication for all ESP32 devices
-void initializePeers() {
-  for (int i = 0; i < sizeof(macAddresses) / sizeof(macAddresses[0]); i++) {
-    memcpy(peerInfo.peer_addr, macAddresses[i], 6);
-    peerInfo.channel = 0;
-    peerInfo.encrypt = false;
-
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.println("Failed to add peer");
-    }
-  }
-}
+void sendData();
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
+bool modeRequiresGPS();
+bool modeRequiresMPU();
 
 void setup() {
     Serial.begin(115200);
-    delay(1000); // Initial delay to allow the serial monitor to initialize
+    //sensor setup
+    initializeGPS();
+    initializeMPU();
+    WiFi.mode(WIFI_STA); // Set WiFi to station mode
+    esp_read_mac(selfMac, ESP_MAC_WIFI_STA); // Get this device's MAC address
 
-    WiFi.mode(WIFI_STA);
+    // Determine the opposite MAC address
+    for (int i = 0; i < sizeof(macAddresses) / sizeof(macAddresses[0]); i++) {
+        if (memcmp(selfMac, macAddresses[i], 6) != 0) { // If not this device's MAC
+            memcpy(oppositeMac, macAddresses[i], 6);   // Set as opposite MAC
+        }
+    }
+
+    Serial.printf("Self MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                  selfMac[0], selfMac[1], selfMac[2], 
+                  selfMac[3], selfMac[4], selfMac[5]);
+    Serial.printf("Opposite MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                  oppositeMac[0], oppositeMac[1], oppositeMac[2], 
+                  oppositeMac[3], oppositeMac[4], oppositeMac[5]);
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
         return;
     }
-
-    initializePeers();
     esp_now_register_send_cb(onDataSent);
     esp_now_register_recv_cb(onDataRecv);
 
-    // Initialize button pins
-    for (int i = 0; i < numberOfButtons; i++) {
-        pinMode(buttonPins[i], INPUT_PULLUP);
-    }
-
-    strip.begin();
-    strip.setBrightness(50);
-    strip.show();
-
-    #ifdef PIN_NEOPIXEL
-        pinMode(NEOPIXEL_POWER, OUTPUT);
-        digitalWrite(NEOPIXEL_POWER, HIGH);
-        builtInLED.begin();
-        builtInLED.show();
-    #endif
-
-    // Custom I2C pin configuration (very stupid, all of these parts are Adafruit and I shouldn't have to specify)
-    Wire.begin(41, 40); // Set SDA to GPIO 41 and SCL to GPIO 40
-
-    // Only initialize the GPS if this device is supposed to have one (skip MPU device as hack for now)
-    if (GPS.begin(0x10)) { // Replace 0x10 with the correct address if needed
-      hasGPS = true;
-      Serial.println("GPS initialized successfully!");
-      // Send configuration commands
-      GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
-      GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
-      GPS.sendCommand(PGCMD_ANTENNA);
+    // Add opposite peer
+    memcpy(peerInfo.peer_addr, oppositeMac, 6);
+    peerInfo.channel = 0; // Default channel
+    peerInfo.encrypt = false; // No encryption
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add opposite peer.");
     } else {
-      Serial.println("Failed to initialize GPS.");
+        Serial.println("Opposite peer added successfully.");
     }
-
-    // Only initialize the MPU-6050 if this device is supposed to have one
-    if (hasMPU) {
-        if (mpu.begin()) {
-            mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-            mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-            mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
-            Serial.println("MPU6050 initialized successfully.");
-        } else {
-            Serial.println("Failed to initialize MPU6050.");
-            hasMPU = false;
-        }
-    }
-
-    delay(1000); // Delay to ensure all components are properly initialized
 }
 
 void loop() {
-    // Button press logic remains the same
+    // Check all button pins
     for (int i = 0; i < numberOfButtons; i++) {
         if (digitalRead(buttonPins[i]) == LOW) {
-            mode = (mode + 1) % 7;
-            syncData.mode = mode;
-            esp_now_send(nullptr, (uint8_t *)&syncData, sizeof(syncData));
-            setLEDColorForMode(mode);
+            delay(50); // Simple debounce
+            while (digitalRead(buttonPins[i]) == LOW); // Wait for release
+            mode = (mode + 1) % 6; // Change mode
+            if (modeRequiresGPS() && hasGPS) {
+                isMaster = true;
+            } else if (modeRequiresMPU() && hasMPU) {
+                isMaster = true;
+            } else {
+                isMaster = false;
+            }
             delay(200); // Debounce delay
         }
     }
-
-    // Only handle GPS if this device has it
-    if (hasGPS && modeRequiresGPS()) {
+    // Process GPS if available
+    if (hasGPS) {
         readGPSData();
     }
 
-    // Only handle MPU-6050 if this device has it
-    if (hasMPU && modeRequiresMPU()) {
+    // Process MPU if available
+    if (hasMPU) {
         readGyroData();
     }
 
-    applyEffectToStrip();
+    // Call sendData 
+    sendData();
+
+    // Debug output
+    if (DEBUG_MODE) {
+        debugOutput();
+    }
+    // Apply LED effects
     delay(20);
+    applyEffectToStrip();
+}
 
-    if (DEBUG_MODE){
-      debugOutput(DEBUG_FUNCTIONS, DEBUG_FUNCTIONS_SIZE);
+void sendData() {
+    if (hasGPS) {
+        GPSData gpsData = { 
+            .speed = static_cast<uint16_t>(currentSpeed * 10), 
+            .direction = static_cast<int16_t>(currentDirection * 10), 
+            .elevation = static_cast<int16_t>(gpsElevation) 
+        };
+        esp_err_t result = esp_now_send(oppositeMac, (uint8_t *)&gpsData, sizeof(gpsData));
+        if (result != ESP_OK && isDebugFunctionEnabled("MEMORY_SYNC")) {
+            Serial.println("GPS send failed.");
+        } else if(isDebugFunctionEnabled("MEMORY_SYNC")) {
+            Serial.println("GPS data sent successfully.");
+        }
+    }
+
+    if (hasMPU) {
+        MPUData mpuData = { 
+            .accelX = static_cast<int16_t>(accelX * 1000), 
+            .accelY = static_cast<int16_t>(accelY * 1000), 
+            .accelZ = static_cast<int16_t>(accelZ * 1000),
+            .gyroX = static_cast<int16_t>(gyroX * 10), 
+            .gyroY = static_cast<int16_t>(gyroY * 10), 
+            .gyroZ = static_cast<int16_t>(gyroZ * 10) 
+        };
+        esp_err_t result = esp_now_send(oppositeMac, (uint8_t *)&mpuData, sizeof(mpuData));
+        if (result != ESP_OK && isDebugFunctionEnabled("MEMORY_SYNC")) {
+            Serial.println("MPU send failed.");
+        } else if (isDebugFunctionEnabled("MEMORY_SYNC")) {
+            Serial.println("MPU data sent successfully.");
+        }
     }
 }
 
-// Debug function to output sensor information selectively
-void debugOutput(String functions[], int numFunctions) {
-  // Loop through each function name in the array
-  for (int i = 0; i < numFunctions; i++) {
-    if (functions[i] == "GPS_SPEED" && hasGPS) {
-      Serial.print("Current Speed: ");
-      Serial.println(currentSpeed);
-      delay(1000);
+// --- ESP-NOW Callbacks ---
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    if(isDebugFunctionEnabled("MEMORY_SYNC")){
+        Serial.print("Last Packet Send Status: ");
+        Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
     }
-    if (functions[i] == "GPS_LOC" && hasGPS) {
-      // Capture and output GPS location data
-      Serial.print("Latitude: ");
-      Serial.println(GPS.latitudeDegrees);
-      Serial.print("Longitude: ");
-      Serial.println(GPS.longitudeDegrees);
-      delay(1000);
-    }
-    if (functions[i] == "GPS_ELEV" && hasGPS) {
-      // Capture and output GPS elevation data
-      Serial.print("Elevation: ");
-      Serial.println(GPS.altitude);
-      delay(1000);
-    }
-    if (functions[i] == "GYRO_XYZ" && hasMPU) {
-      sensors_event_t a, g, temp;
-      mpu.getEvent(&a, &g, &temp);
-      Serial.print("Gyro X: ");
-      Serial.print(g.gyro.x);
-      Serial.print(" rad/s, Y: ");
-      Serial.print(g.gyro.y);
-      Serial.print(" rad/s, Z: ");
-      Serial.println(g.gyro.z);
-      delay(1000);
-    }
-    if (functions[i] == "GYRO_ACCEL" && hasMPU) {
-      sensors_event_t a, g, temp;
-      mpu.getEvent(&a, &g, &temp);
-      Serial.print("Accel X: ");
-      Serial.print(a.acceleration.x);
-      Serial.print(", Y: ");
-      Serial.print(a.acceleration.y);
-      Serial.print(", Z: ");
-      Serial.println(a.acceleration.z);
-      delay(1000); 
-    }
-  }
 }
 
-// --- Sensor Data Functions ---
-void readSensorData() {
-  if (hasGPS) {
-    readGPSData();
-    delay(10); // Small delay to prevent I2C bus collisions
-  }
-  if (hasMPU) {
-    readGyroData();
-    delay(10); // Small delay to prevent I2C bus collisions
-  }
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+    if(isDebugFunctionEnabled("MEMORY_SYNC")){
+        Serial.printf("Received data from: %02X:%02X:%02X:%02X:%02X:%02X, Length: %d\n",
+                    mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5], len);
+    }
+
+    if (memcmp(mac_addr, oppositeMac, 6) == 0) {
+        // Process data only if it came from the opposite MAC
+        if (len == sizeof(GPSData)) {
+            GPSData *receivedGPS = (GPSData *)incomingData;
+            syncData.gpsData = *receivedGPS;
+            if(isDebugFunctionEnabled("MEMORY_SYNC")){
+                Serial.println("Received GPS Data");
+            }
+        }
+
+        if (len == sizeof(MPUData)) {
+            MPUData *receivedMPU = (MPUData *)incomingData;
+            syncData.mpuData = *receivedMPU;
+            if(isDebugFunctionEnabled("MEMORY_SYNC")){
+                Serial.println("Received MPU Data");
+            }
+        }
+    } else if (isDebugFunctionEnabled("MEMORY_SYNC")) {
+            Serial.println("Ignored data from an unknown device.");      
+    }
 }
 
+// helper funcs
+bool isDebugFunctionEnabled(const std::string& functionName) {
+    auto it = debugFunctions.find(functionName);
+    if (it != debugFunctions.end()) {
+        return it->second; // Return whether the function is enabled
+    }
+    return false; // Function not found
+}
+
+// --- Debugging ---
+void debugOutput() {
+    static unsigned long lastDebugTime = 0;
+    const unsigned long debugInterval = 2000; // Interval in milliseconds (e.g., 2000ms = 2 seconds)
+
+    if (millis() - lastDebugTime < debugInterval) {
+        return; // Skip debug output if interval has not elapsed
+    } 
+
+    lastDebugTime = millis(); // Update the last debug time
+
+    if(hasGPS){
+        if (isDebugFunctionEnabled("GPS_SPEED")) {
+            Serial.print("Speed (mph): ");
+            Serial.println(currentSpeed);
+        } 
+        if (isDebugFunctionEnabled("GPS_LOC")) {
+            Serial.print("Latitude: ");
+            Serial.println(gpsLatitude, 6);
+            Serial.print("Longitude: ");
+            Serial.println(gpsLongitude, 6);
+        } 
+        if (isDebugFunctionEnabled("GPS_ELEV")) {
+            Serial.print("Elevation (meters): ");
+            Serial.println(gpsElevation);
+        } 
+        if (isDebugFunctionEnabled("GPS_SATS")) {
+            Serial.print("Satellites: ");
+            Serial.println(gpsSatellites);
+        }
+    }
+    // gyro functions
+    if(hasMPU){
+        if (isDebugFunctionEnabled("GYRO_XYZ")) {
+            sensors_event_t a, g, temp;
+            mpu.getEvent(&a, &g, &temp);
+            Serial.print("Gyro X: ");
+            Serial.print(g.gyro.x);
+            Serial.print(" rad/s, Y: ");
+            Serial.print(g.gyro.y);
+            Serial.print(" rad/s, Z: ");
+            Serial.println(g.gyro.z);
+        } 
+        if (isDebugFunctionEnabled("GYRO_ACCEL")) {
+            sensors_event_t a, g, temp;
+            mpu.getEvent(&a, &g, &temp);
+            Serial.print("Accel X: ");
+            Serial.print(a.acceleration.x);
+            Serial.print(", Y: ");
+            Serial.print(a.acceleration.y);
+            Serial.print(", Z: ");
+            Serial.println(a.acceleration.z);
+        } 
+    }
+}
+
+// --- GPS ---
 void readGPSData() {
-      while (GPS.available()) {
-      GPS.read();
-      if (GPS.fix && (millis() - lastGPSUpdate >= gpsUpdateInterval)) {
-          Serial.print("Fix acquired!");
-          lastGPSUpdate = millis();
-          currentSpeed = GPS.speed * 1.15078; // Convert knots to mph
-          gpsLatitude = GPS.latitudeDegrees;
-          gpsLongitude = GPS.longitudeDegrees;
-          gpsElevation = GPS.altitude;
-      }
-  }
+    while (gpsSerial.available() > 0) {
+        char c = gpsSerial.read();
+        gps.encode(c);
+
+        if (gps.location.isUpdated()) {
+            gpsLatitude = gps.location.lat();
+            gpsLongitude = gps.location.lng();
+        }
+        if (gps.altitude.isUpdated()) {
+            gpsElevation = gps.altitude.meters();
+        }
+        if (gps.speed.isUpdated()) {
+            float rawSpeed = gps.speed.mph();
+            if (rawSpeed < 0.5) {  // Treat speeds below 0.5 mph as stationary
+                currentSpeed = 0;
+            } else {
+                currentSpeed = rawSpeed;
+            }
+        }
+        if (gps.satellites.isUpdated()) {
+            gpsSatellites = gps.satellites.value();
+        }
+        if (gps.hdop.isUpdated()) {
+            gpsHDOP = gps.hdop.value();
+        }
+    }
 }
 
+void initializeGPS() {
+    Serial.println("Initializing GPS...");
+    hasGPS = false; // Assume GPS is not present initially
+
+    // Attempt to communicate with the GPS
+    gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
+    unsigned long startTime = millis();
+    while (millis() - startTime < 2000) { // 2-second timeout
+        if (gpsSerial.available()) {
+            hasGPS = true; // If data is coming in, assume GPS is present
+            Serial.println("GPS detected and initialized.");
+            return;
+        }
+    }
+
+    Serial.println("GPS not detected.");
+}
+
+void initializeMPU() {
+      // I2C bus setup
+    Wire.begin(RXPin, TXPin); // Set SDA to GPIO 41 and SCL to GPIO 40
+    Serial.println("Initializing MPU...");
+    // Optional: I2C scan for debugging
+    if (mpu.begin()) {
+        hasMPU = true;
+        mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+        mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+        Serial.println("MPU6050 initialized successfully.");
+    } else {
+        Serial.println("Failed to initialize MPU6050.");
+        hasMPU = false;
+    }
+}
+
+// --- MPU ---
 void readGyroData() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
 
     // Ensure we are capturing gyro values in degrees per second
-    currentDirection = g.gyro.z * 57.2958; // Convert radians to degrees
+    currentDirection = g.gyro.z; // Convert radians to degrees
+
+    // Update accelerometer data
+    accelX = a.acceleration.x;
+    accelY = a.acceleration.y;
+    accelZ = a.acceleration.z;
+
+    // Update gyroscope data
+    gyroX = g.gyro.x * 57.2958; // Convert radians to degrees
+    gyroY = g.gyro.y * 57.2958;
+    gyroZ = g.gyro.z * 57.2958;
+}
+
+// --- LED Effects ---
+void applyEffectToStrip() {
+    if (isMaster) {
+        switch (mode) {
+            case 0: strip.clear(); break;
+            case 1: scrollingRainbow(); break;
+            case 2: directionalStrobe(); break;
+            case 3: cometTail(); break;
+            case 4: twinkleBurst(); break;
+            case 5: breathingEffect(); break;
+            case 6: gyroRainbowEffect(); break;
+        }
+        strip.show();
+    }
+}
+
+void setLEDColorForMode(uint8_t mode) {
+    // LED mode logic
+    #ifdef PIN_NEOPIXEL
+    uint8_t r = 0, g = 0, b = 0;
+    switch (mode) {
+        case 0: r = 255; g = 0; b = 0; break;
+        case 1: r = 0; g = 255; b = 0; break;
+        case 2: r = 0; g = 0; b = 255; break;
+        case 3: r = 255; g = 255; b = 0; break;
+        case 4: r = 0; g = 255; b = 255; break;
+        case 5: r = 255; g = 0; b = 255; break;
+        case 6: r = 255; g = 255; b = 255; break; // White for Gyro Rainbow Mode
+    }
+    builtInLED.setPixelColor(0, builtInLED.Color(r, g, b));
+    builtInLED.show();
+    #endif
+}
+
+void scrollingRainbow() {
+    uint16_t speedFactor = map(constrain(currentSpeed, 0, 20), 0, 20, 5, 100);
+    for (int i = 0; i < NUM_LEDS; i++) {
+        uint32_t color = strip.ColorHSV((hue + (i * 65536L / NUM_LEDS)) % 65536, 255, 255);
+        strip.setPixelColor(i, color);
+    }
+    hue += speedFactor;
+    if (hue >= 65536) hue -= 65536;
+}
+
+void directionalStrobe() {
+    uint16_t strobeInterval = map(abs(currentDirection), 0, 180, 100, 10);
+    static uint32_t lastUpdate = 0;
+
+    if (millis() - lastUpdate > strobeInterval) {
+        for (int i = 0; i < NUM_LEDS; i++) {
+            strip.setPixelColor(i, (i % 2 == 0) ? strip.Color(255, 255, 255) : 0);
+        }
+        lastUpdate = millis();
+    } else {
+        strip.clear();
+    }
+}
+
+void cometTail() {
+    static int cometPos = 0;
+    uint16_t tailLength = map(currentSpeed, 0, 20, 5, 20);
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+        if (i == cometPos) {
+            strip.setPixelColor(i, strip.Color(0, 255, 255));
+        } else if (i < cometPos && cometPos - i <= tailLength) {
+            uint8_t brightness = 255 - ((cometPos - i) * (255 / tailLength));
+            strip.setPixelColor(i, strip.Color(0, brightness, brightness));
+        } else {
+            strip.setPixelColor(i, 0);
+        }
+    }
+    cometPos = (cometPos + 1) % NUM_LEDS;
+}
+
+void twinkleBurst() {
+    uint8_t chanceOfTwinkle = map(abs(currentDirection), 0, 180, 10, 100);
+    strip.clear();
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+        if (random(0, 255) < chanceOfTwinkle) {
+            strip.setPixelColor(i, strip.Color(255, 255, 255));
+        }
+    }
+}
+
+void breathingEffect() {
+    static uint16_t brightness = 0;
+    static int direction = 1;
+
+    uint16_t breathInterval = map(currentSpeed, 0, 20, 50, 10);
+    
+    brightness += direction * breathInterval;
+    if (brightness >= 255) {
+        brightness = 255;
+        direction = -1;
+    } else if (brightness <= 0) {
+        brightness = 0;
+        direction = 1;
+    }
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+        strip.setPixelColor(i, strip.Color(brightness, brightness, brightness));
+    }
+}
+
+void gyroRainbowEffect() {
+    sensors_event_t accel, gyro, temp;
+    mpu.getEvent(&accel, &gyro, &temp);
+
+    float xRotation = gyro.gyro.x * 57.2958;
+    float yRotation = gyro.gyro.y * 57.2958;
+    float zRotation = gyro.gyro.z * 57.2958;
+
+    // Cast to int to perform modulo operation
+    uint16_t combinedHue = (static_cast<int>(abs(xRotation)) + 
+                            static_cast<int>(abs(yRotation)) + 
+                            static_cast<int>(abs(zRotation))) * 100 % 65536;
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+        uint32_t color = strip.ColorHSV(combinedHue, 255, 255);
+        strip.setPixelColor(i, color);
+    }
+    strip.show();
 }
 
 // --- Mode Requirements ---
 bool modeRequiresGPS() { return (mode == 1 || mode == 3); }
 bool modeRequiresMPU() { return (mode == 2 || mode == 4); }
-
-// --- LED Color and Effect Functions ---
-void setLEDColorForMode(uint8_t mode) {
-  #ifdef PIN_NEOPIXEL
-    uint8_t r = 0, g = 0, b = 0;
-    switch (mode) {
-      case 0: r = 255; g = 0; b = 0; break;
-      case 1: r = 0; g = 255; b = 0; break;
-      case 2: r = 0; g = 0; b = 255; break;
-      case 3: r = 255; g = 255; b = 0; break;
-      case 4: r = 0; g = 255; b = 255; break;
-      case 5: r = 255; g = 0; b = 255; break;
-      case 6: r = 255; g = 255; b = 255; break; // White for Gyro Rainbow Mode
-    }
-    builtInLED.setPixelColor(0, builtInLED.Color(r, g, b));
-    builtInLED.show();
-  #endif
-}
-
-void applyEffectToStrip() {
-  switch (mode) {
-    case 0: strip.clear(); break;
-    case 1: scrollingRainbow(); break;
-    case 2: directionalStrobe(); break;
-    case 3: cometTail(); break;
-    case 4: twinkleBurst(); break;
-    case 5: breathingEffect(); break;
-    case 6: gyroRainbowEffect(); break; // New gyroscope-based rainbow effect
-  }
-  strip.show();
-}
-
-void scrollingRainbow() {
-  uint16_t speedFactor = map(constrain(currentSpeed, 0, 20), 0, 20, 5, 100);
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint32_t color = strip.ColorHSV((hue + (i * 65536L / NUM_LEDS)) % 65536, 255, 255);
-    strip.setPixelColor(i, color);
-  }
-  hue += speedFactor;
-  if (hue >= 65536) hue -= 65536;
-}
-
-void directionalStrobe() {
-  uint16_t strobeInterval = map(abs(currentDirection), 0, 180, 100, 10);
-  static uint32_t lastUpdate = 0;
-
-  if (millis() - lastUpdate > strobeInterval) {
-    for (int i = 0; i < NUM_LEDS; i++) {
-      if (i % 2 == 0) {
-        strip.setPixelColor(i, strip.Color(255, 255, 255));
-      } else {
-        strip.setPixelColor(i, 0);
-      }
-    }
-    lastUpdate = millis();
-  } else {
-    strip.clear();
-  }
-}
-
-void cometTail() {
-  uint16_t tailLength = map(currentSpeed, 0, 20, 5, 20);
-  static int cometPos = 0;
-
-  for (int i = 0; i < NUM_LEDS; i++) {
-    if (i == cometPos) {
-      strip.setPixelColor(i, strip.Color(0, 255, 255));
-    } else if (i < cometPos && cometPos - i <= tailLength) {
-      uint8_t brightness = 255 - ((cometPos - i) * (255 / tailLength));
-      strip.setPixelColor(i, strip.Color(0, brightness, brightness));
-    } else {
-      strip.setPixelColor(i, 0);
-    }
-  }
-  cometPos = (cometPos + 1) % NUM_LEDS;
-}
-
-void twinkleBurst() {
-  uint8_t chanceOfTwinkle = map(abs(currentDirection), 0, 180, 10, 100);
-  strip.clear();
-
-  for (int i = 0; i < NUM_LEDS; i++) {
-    if (random(0, 255) < chanceOfTwinkle) {
-      strip.setPixelColor(i, strip.Color(255, 255, 255));
-    }
-  }
-}
-
-void breathingEffect() {
-  static uint16_t brightness = 0;
-  static int direction = 1;
-
-  uint16_t breathInterval = map(currentSpeed, 0, 20, 50, 10);
-  
-  brightness += direction * breathInterval;
-  if (brightness >= 255) {
-    brightness = 255;
-    direction = -1;
-  } else if (brightness <= 0) {
-    brightness = 0;
-    direction = 1;
-  }
-
-  for (int i = 0; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, strip.Color(brightness, brightness, brightness));
-  }
-}
-
-void gyroRainbowEffect() {
-  // Check if the MPU6050 is available
-  if (!mpu.begin()) {
-    Serial.println("Reinitializing MPU6050...");
-    if (!mpu.begin()) {
-      Serial.println("Failed to reinitialize MPU6050.");
-      return;
-    }
-    Serial.println("MPU6050 reinitialized successfully.");
-  }
-
-  // Get sensor events
-  sensors_event_t accel, gyro, temp;
-  mpu.getEvent(&accel, &gyro, &temp);
-
-  // Convert gyro values from radians to degrees
-  float xRotation = gyro.gyro.x * 57.2958;
-  float yRotation = gyro.gyro.y * 57.2958;
-  float zRotation = gyro.gyro.z * 57.2958;
-
-  // Use acceleration values directly
-  float xAccel = accel.acceleration.x;
-  float yAccel = accel.acceleration.y;
-  float zAccel = accel.acceleration.z;
-
-  // Normalize the values to a 0-65535 range for hue
-  uint16_t hueX = (uint16_t)(abs(xRotation) * 100) % 65536;
-  uint16_t hueY = (uint16_t)(abs(yRotation) * 100) % 65536;
-  uint16_t hueZ = (uint16_t)(abs(zRotation) * 100) % 65536;
-
-  uint16_t accelHueX = (uint16_t)(abs(xAccel) * 5000) % 65536;
-  uint16_t accelHueY = (uint16_t)(abs(yAccel) * 5000) % 65536;
-  uint16_t accelHueZ = (uint16_t)(abs(zAccel) * 5000) % 65536;
-
-  // Combine all hues
-  uint16_t combinedHue = (hueX + hueY + hueZ + accelHueX + accelHueY + accelHueZ) / 6;
-
-  // Set the color across the LED strip using the combined hue
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint32_t color = strip.ColorHSV(combinedHue, 255, 255); // Full saturation and brightness
-    strip.setPixelColor(i, color);
-  }
-  strip.show();
-}
-
-// --- ESP-NOW Callbacks ---
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("Last Packet Send Status: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
-}
-
-void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-  memcpy(&syncData, incomingData, sizeof(syncData));
-  mode = syncData.mode;
-  hue = syncData.hue;
-  currentSpeed = syncData.speed;
-  currentDirection = syncData.direction;
-  setLEDColorForMode(mode);
-  sharedLEDColor(syncData.color[0], syncData.color[1], syncData.color[2]);
-}
-
-void sharedLEDColor(uint8_t r, uint8_t g, uint8_t b) {
-  syncData.color[0] = r;
-  syncData.color[1] = g;
-  syncData.color[2] = b;
-  #ifdef PIN_NEOPIXEL
-    builtInLED.setPixelColor(0, builtInLED.Color(r, g, b));
-    builtInLED.show();
-  #endif
-}
