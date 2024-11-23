@@ -19,19 +19,19 @@
 
 // List debug functions and their enabled status
 std::unordered_map<std::string, bool> debugFunctions = {
-    {"GPS_SPEED", true},
-    {"GPS_LOC", true},
-    {"GPS_ELEV", true},
-    {"GPS_SATS", true},
-    {"GYRO_XYZ", true},
-    {"GYRO_ACCEL", true},
+    {"GPS_SPEED", false},
+    {"GPS_LOC", false},
+    {"GPS_ELEV", false},
+    {"GPS_SATS", false},
+    {"GYRO_XYZ", false},
+    {"GYRO_ACCEL", false},
     {"MEMORY_SYNC", false}
 };
 
 const int buttonPins[] = BUTTON_PINS;
 const int numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
 
-// GPS Pins and Baud Rate
+// STEMMA QT Pins (and Baud Rate for GPS)
 #define RXPin 41  // GPS TX -> ESP RX
 #define TXPin 40  // GPS RX -> ESP TX
 #define GPSBaud 38400
@@ -43,9 +43,9 @@ Adafruit_MPU6050 mpu;
 
 // GPS data variables
 float currentSpeed = 0;
-float gpsLatitude = 0.0;
-float gpsLongitude = 0.0;
-float gpsElevation = 0.0;
+float currentLatitude = 0.0;
+float currentLongitude = 0.0;
+float currentElevation = 0.0;
 unsigned int gpsSatellites = 0;
 float gpsHDOP = 0.0;
 
@@ -76,9 +76,9 @@ Adafruit_NeoPixel builtInLED = Adafruit_NeoPixel(1, BUILTIN_LED_PIN, NEO_GRB + N
 #endif
 
 typedef struct __attribute__((packed)) {
-    uint16_t speed;          // Scaled to tenths of mph
-    int16_t direction;       // Scaled to tenths of degrees
-    int16_t elevation;       // Scaled to meters
+    uint16_t currentSpeed;          // Scaled to tenths of mph
+    int16_t currentDirection;       // Scaled to tenths of degrees
+    int16_t currentElevation;       // Scaled to meters
 } GPSData;
 
 typedef struct __attribute__((packed)) {
@@ -91,22 +91,11 @@ typedef struct __attribute__((packed)) {
 } MPUData;
 
 typedef struct __attribute__((packed)) {
-    uint8_t mode;            // Current mode
-    uint8_t color[3];        // RGB color data
-    uint16_t hue;            // Hue for effects
     GPSData gpsData;         // GPS-specific data
     MPUData mpuData;         // MPU-specific data
-    uint8_t hasGPS;          // Flags to indicate ownership
-    uint8_t hasMPU;
-} LEDSyncData;
+} SyncData;
 
-LEDSyncData syncData;
-
-unsigned long lastGPSSendTime = 0;
-unsigned long lastMPUSendTime = 0;
-
-const unsigned long gpsSendInterval = 200; // 200ms
-const unsigned long mpuSendInterval = 500; // 500ms
+SyncData syncData;
 
 // Array of peer MAC addresses (replace with actual MAC addresses of devices)
 uint8_t macAddresses[][6] = {
@@ -155,6 +144,8 @@ void gyroRainbowEffect();
 void sendData();
 void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
+void handleModeSync(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
+void syncMode();
 bool modeRequiresGPS();
 bool modeRequiresMPU();
 
@@ -212,9 +203,11 @@ void loop() {
             } else {
                 isMaster = false;
             }
+            syncMode();
             delay(200); // Debounce delay
         }
     }
+
     // Process GPS if available
     if (hasGPS) {
         readGPSData();
@@ -240,9 +233,9 @@ void loop() {
 void sendData() {
     if (hasGPS) {
         GPSData gpsData = { 
-            .speed = static_cast<uint16_t>(currentSpeed * 10), 
-            .direction = static_cast<int16_t>(currentDirection * 10), 
-            .elevation = static_cast<int16_t>(gpsElevation) 
+            .currentSpeed = static_cast<uint16_t>(currentSpeed * 10), 
+            .currentDirection = static_cast<int16_t>(currentDirection * 10), 
+            .currentElevation = static_cast<int16_t>(currentElevation) 
         };
         esp_err_t result = esp_now_send(oppositeMac, (uint8_t *)&gpsData, sizeof(gpsData));
         if (result != ESP_OK && isDebugFunctionEnabled("MEMORY_SYNC")) {
@@ -286,6 +279,7 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
 
     if (memcmp(mac_addr, oppositeMac, 6) == 0) {
         // Process data only if it came from the opposite MAC
+        handleModeSync(mac_addr, incomingData, len);
         if (len == sizeof(GPSData)) {
             GPSData *receivedGPS = (GPSData *)incomingData;
             syncData.gpsData = *receivedGPS;
@@ -303,6 +297,30 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
         }
     } else if (isDebugFunctionEnabled("MEMORY_SYNC")) {
             Serial.println("Ignored data from an unknown device.");      
+    }
+}
+
+void syncMode() {
+    // Sends the current mode to the opposite device
+    esp_err_t result = esp_now_send(oppositeMac, &mode, sizeof(mode));
+    if (result != ESP_OK) {
+        Serial.println("Failed to send mode sync.");
+    } else {
+        Serial.println("Mode sync sent successfully.");
+    }
+}
+
+void handleModeSync(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+    // Handles received mode updates
+    if (len == sizeof(mode)) {
+        uint8_t receivedMode;
+        memcpy(&receivedMode, incomingData, sizeof(receivedMode));
+        
+        if (memcmp(mac_addr, oppositeMac, 6) == 0) {
+            mode = receivedMode;
+            Serial.printf("Mode synchronized to: %d\n", mode);
+            setLEDColorForMode(mode); // Update LED state for the new mode
+        }
     }
 }
 
@@ -333,13 +351,13 @@ void debugOutput() {
         } 
         if (isDebugFunctionEnabled("GPS_LOC")) {
             Serial.print("Latitude: ");
-            Serial.println(gpsLatitude, 6);
+            Serial.println(currentLatitude, 6);
             Serial.print("Longitude: ");
-            Serial.println(gpsLongitude, 6);
+            Serial.println(currentLongitude, 6);
         } 
         if (isDebugFunctionEnabled("GPS_ELEV")) {
             Serial.print("Elevation (meters): ");
-            Serial.println(gpsElevation);
+            Serial.println(currentElevation);
         } 
         if (isDebugFunctionEnabled("GPS_SATS")) {
             Serial.print("Satellites: ");
@@ -373,31 +391,44 @@ void debugOutput() {
 
 // --- GPS ---
 void readGPSData() {
+    bool dataUpdated = false; // Flag to track if any GPS data has been updated
+
     while (gpsSerial.available() > 0) {
         char c = gpsSerial.read();
-        gps.encode(c);
+        gps.encode(c); // Feed the GPS library with the received data
 
+        // Check and update individual data points
         if (gps.location.isUpdated()) {
-            gpsLatitude = gps.location.lat();
-            gpsLongitude = gps.location.lng();
+            currentLatitude = gps.location.lat();
+            currentLongitude = gps.location.lng();
+            dataUpdated = true;
         }
         if (gps.altitude.isUpdated()) {
-            gpsElevation = gps.altitude.meters();
+            currentElevation = gps.altitude.meters();
+            dataUpdated = true;
         }
         if (gps.speed.isUpdated()) {
-            float rawSpeed = gps.speed.mph();
-            if (rawSpeed < 0.5) {  // Treat speeds below 0.5 mph as stationary
-                currentSpeed = 0;
-            } else {
-                currentSpeed = rawSpeed;
-            }
+            currentSpeed = gps.speed.mph() > 0.5 ? gps.speed.mph() : 0.0;
+            dataUpdated = true;
         }
         if (gps.satellites.isUpdated()) {
             gpsSatellites = gps.satellites.value();
+            dataUpdated = true;
         }
         if (gps.hdop.isUpdated()) {
             gpsHDOP = gps.hdop.value();
+            dataUpdated = true;
         }
+    }
+
+    // Output default values if no data has been updated
+    if (!dataUpdated) {
+        currentLatitude = 0.0;
+        currentLongitude = 0.0;
+        currentElevation = 0.0;
+        currentSpeed = 0.0;
+        gpsSatellites = 0;
+        gpsHDOP = 0.0;
     }
 }
 
@@ -405,18 +436,26 @@ void initializeGPS() {
     Serial.println("Initializing GPS...");
     hasGPS = false; // Assume GPS is not present initially
 
-    // Attempt to communicate with the GPS
     gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
+
     unsigned long startTime = millis();
-    while (millis() - startTime < 2000) { // 2-second timeout
-        if (gpsSerial.available()) {
-            hasGPS = true; // If data is coming in, assume GPS is present
-            Serial.println("GPS detected and initialized.");
-            return;
+    gpsSerial.flush(); // Clear any residual data in the serial buffer
+
+    while (millis() - startTime < 3000) { // 3-second timeout
+        if (gpsSerial.available() > 0) {
+            char c = gpsSerial.read();
+            gps.encode(c); // Feed the GPS library with the received data
+
+            // Check if the GPS library has detected a valid sentence
+            if (gps.location.isValid() || gps.date.isValid() || gps.time.isValid()) {
+                hasGPS = true;
+                Serial.println("GPS detected and initialized.");
+                return;
+            }
         }
     }
 
-    Serial.println("GPS not detected.");
+    Serial.println("GPS not detected. Continuing without GPS.");
 }
 
 void initializeMPU() {
@@ -583,4 +622,4 @@ void gyroRainbowEffect() {
 
 // --- Mode Requirements ---
 bool modeRequiresGPS() { return (mode == 1 || mode == 3); }
-bool modeRequiresMPU() { return (mode == 2 || mode == 4); }
+bool modeRequiresMPU() { return (mode == 2 || mode == 4 || mode == 5 || mode == 6); }
