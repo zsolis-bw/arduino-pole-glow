@@ -203,6 +203,7 @@ void loop() {
             } else {
                 isMaster = false;
             }
+            setLEDColorForMode(mode); // Update LED state for the new mode
             syncMode();
             delay(200); // Debounce delay
         }
