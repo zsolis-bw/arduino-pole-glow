@@ -10,53 +10,43 @@
 #include <unordered_map>
 #include <string>
 #include <iostream>
+#include <vector>
+#include <array>
+
+// Dynamic list of peers
+std::vector<std::array<uint8_t, 6>> pairedDevices;
 
 // Pin and hardware definitions
 #define DATA_PIN 17
 #define NUM_LEDS 50
-#define BUTTON_PINS {0, 18} // Array of GPIO pins to use for buttons
 #define DEBUG_MODE true
+#define MAX_PEERS 1
+#define PAIRING_SECONDS 25
 
 // List debug functions and their enabled status
 std::unordered_map<std::string, bool> debugFunctions = {
     {"GPS_SPEED", false},
     {"GPS_LOC", false},
     {"GPS_ELEV", false},
-    {"GPS_SATS", false},
-    {"GYRO_XYZ", false},
+    {"GPS_SATS", true},
+    {"GYRO_XYZ", true},
     {"GYRO_ACCEL", false},
-    {"MEMORY_SYNC", false}
+    {"MEMORY_SYNC", true}
 };
 
-const int buttonPins[] = BUTTON_PINS;
-const int numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
+int* buttonPins; // to-do, make this a flexible sized array
+int numberOfButtons;
 
-// STEMMA QT Pins (and Baud Rate for GPS)
-#define RXPin 41  // GPS TX -> ESP RX
-#define TXPin 40  // GPS RX -> ESP TX
+// vars for pin mapping to sensor IO
+int RXPin;  // GPS TX -> ESP RX
+int TXPin;  // GPS RX -> ESP TX
+
 #define GPSBaud 38400
 
 // GPS and MPU objects
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1); // Use Serial1 for GPS
 Adafruit_MPU6050 mpu;
-
-// GPS data variables
-float currentSpeed = 0;
-float currentLatitude = 0.0;
-float currentLongitude = 0.0;
-float currentElevation = 0.0;
-unsigned int gpsSatellites = 0;
-float gpsHDOP = 0.0;
-
-// MPU data variables
-float currentDirection = 0;
-float accelX = 0.0;
-float accelY = 0.0;
-float accelZ = 0.0;
-float gyroX = 0.0;
-float gyroY = 0.0;
-float gyroZ = 0.0;
 
 // Other variables
 unsigned long lastGPSUpdate = 0;
@@ -66,6 +56,8 @@ uint16_t hue = 0;
 bool hasGPS = false;
 bool hasMPU = false;
 bool isMaster = false;
+bool modeSyncInProgress = false;
+bool isPairingMode = true; // Flag for pairing mode
 
 // NeoPixel and ESP-NOW structures
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
@@ -76,38 +68,48 @@ Adafruit_NeoPixel builtInLED = Adafruit_NeoPixel(1, BUILTIN_LED_PIN, NEO_GRB + N
 #endif
 
 typedef struct __attribute__((packed)) {
-    uint16_t currentSpeed;          // Scaled to tenths of mph
-    int16_t currentDirection;       // Scaled to tenths of degrees
-    int16_t currentElevation;       // Scaled to meters
+    float currentDirection;       // Scaled to tenths of degrees
+    float currentSpeed;
+    float currentLatitude;
+    float currentLongitude;
+    float currentElevation;
+    unsigned int gpsSatellites;
+    float gpsHDOP;
 } GPSData;
 
 typedef struct __attribute__((packed)) {
-    int16_t accelX;          // Scaled to milli-g
-    int16_t accelY;          // Scaled to milli-g
-    int16_t accelZ;          // Scaled to milli-g
-    int16_t gyroX;           // Scaled to tenths of degrees/sec
-    int16_t gyroY;           // Scaled to tenths of degrees/sec
-    int16_t gyroZ;           // Scaled to tenths of degrees/sec
+    float currentDirection;
+    float accelX;          // Scaled to milli-g
+    float accelY;          // Scaled to milli-g
+    float accelZ;          // Scaled to milli-gxf
+    float gyroX;           // Scaled to tenths of degrees/sec
+    float gyroY;           // Scaled to tenths of degrees/sec
+    float gyroZ;           // Scaled to tenths of degrees/sec
 } MPUData;
 
-typedef struct __attribute__((packed)) {
-    GPSData gpsData;         // GPS-specific data
-    MPUData mpuData;         // MPU-specific data
-} SyncData;
-
-SyncData syncData;
-
+GPSData gpsData;
+MPUData mpuData;
+const unsigned long debounceDelay = 50; // 50 ms debounce time
+/*
 // Array of peer MAC addresses (replace with actual MAC addresses of devices)
 uint8_t macAddresses[][6] = {
-    {0xD4, 0xF9, 0x8D, 0x66, 0x12, 0xCA}, // Replace with your first ESP32 MAC
-    {0xF4, 0x12, 0xFA, 0x59, 0x5B, 0x30}  // Replace with your second ESP32 MAC
+    //{0xD4, 0xF9, 0x8D, 0x66, 0x12, 0xCA}, // Replace with your first ESP32 MAC
+    //{0xF4, 0x12, 0xFA, 0x59, 0x5B, 0x30},  // Replace with your second ESP32 MAC, // Replace with your first ESP32 MAC
+    //{0xC8, 0xF0, 0x9E, 0xA8, 0x39, 0xF4}  // dev board
+    {0xA0, 0x76, 0x4E, 0x14, 0x6A, 0xF4},
+    {0x34, 0x85, 0x18, 0x18, 0x25, 0x74}
 };
+*/
+// C3 macs
+// A0:76:4E:14:6A:F4
+// 34:85:18:18:25:74
 
 uint8_t selfMac[6];      // This device's MAC address
 uint8_t oppositeMac[6];  // The opposite device's MAC address
 
 esp_now_peer_info_t peerInfo;
 
+/*
 void initializePeers() {
     for (int i = 0; i < sizeof(macAddresses) / sizeof(macAddresses[0]); i++) {
         memcpy(peerInfo.peer_addr, macAddresses[i], 6);
@@ -125,10 +127,11 @@ void initializePeers() {
         }
     }
 }
-
+*/
 // Forward declarations
 void debugOutput();
 bool isDebugFunctionEnabled(const std::string& functionName);
+void setupPins();
 void readGPSData();
 void readGyroData();
 void initializeGPS();
@@ -148,52 +151,74 @@ void handleModeSync(const uint8_t *mac_addr, const uint8_t *incomingData, int le
 void syncMode();
 bool modeRequiresGPS();
 bool modeRequiresMPU();
+void sendPairingRequest();
+void enterPairingMode(unsigned long duration = 15000); 
+void addPeer(const uint8_t *mac_addr);
 
 void setup() {
     Serial.begin(115200);
-    //sensor setup
-    initializeGPS();
-    initializeMPU();
-    WiFi.mode(WIFI_STA); // Set WiFi to station mode
-    esp_read_mac(selfMac, ESP_MAC_WIFI_STA); // Get this device's MAC address
 
-    // Determine the opposite MAC address
-    for (int i = 0; i < sizeof(macAddresses) / sizeof(macAddresses[0]); i++) {
-        if (memcmp(selfMac, macAddresses[i], 6) != 0) { // If not this device's MAC
-            memcpy(oppositeMac, macAddresses[i], 6);   // Set as opposite MAC
-        }
+    // Sensor setup
+    setupPins();
+    initializeGPS();
+    if (!hasGPS) {
+        initializeMPU();
     }
 
-    Serial.printf("Self MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-                  selfMac[0], selfMac[1], selfMac[2], 
-                  selfMac[3], selfMac[4], selfMac[5]);
-    Serial.printf("Opposite MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-                  oppositeMac[0], oppositeMac[1], oppositeMac[2], 
-                  oppositeMac[3], oppositeMac[4], oppositeMac[5]);
+    Serial.begin(115200);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.macAddress(selfMac);
+    Serial.printf("Self MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  selfMac[0], selfMac[1], selfMac[2], selfMac[3], selfMac[4], selfMac[5]);
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
         return;
     }
-    esp_now_register_send_cb(onDataSent);
+
     esp_now_register_recv_cb(onDataRecv);
 
-    // Add opposite peer
-    memcpy(peerInfo.peer_addr, oppositeMac, 6);
+    uint8_t broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_peer_info_t broadcastPeer = {};
+    memset(broadcastPeer.peer_addr, 0xFF, 6);
+    broadcastPeer.channel = 0;
+    broadcastPeer.encrypt = false;
+    if (esp_now_add_peer(&broadcastPeer) != ESP_OK) {
+        Serial.println("Failed to add broadcast peer.");
+    }
+
+    enterPairingMode(PAIRING_SECONDS*1000);
+
+    // If no peers found, indicate and exit
+    if (pairedDevices.empty()) {
+        Serial.println("No peers found. Running in standalone mode.");
+        return;
+    }
+
+    // Add opposite peer if pairing was successful
+    memcpy(peerInfo.peer_addr, pairedDevices[0].data(), 6);
     peerInfo.channel = 0; // Default channel
-    peerInfo.encrypt = false; // No encryption
+    peerInfo.encrypt = false;
+
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
         Serial.println("Failed to add opposite peer.");
     } else {
         Serial.println("Opposite peer added successfully.");
     }
+
+    esp_now_register_send_cb(onDataSent);
 }
 
 void loop() {
+    // stubbed off while pairing
+    if (isPairingMode){
+        return;
+    }
     // Check all button pins
     for (int i = 0; i < numberOfButtons; i++) {
         if (digitalRead(buttonPins[i]) == LOW) {
-            delay(50); // Simple debounce
+            delay(50);
             while (digitalRead(buttonPins[i]) == LOW); // Wait for release
             mode = (mode + 1) % 6; // Change mode
             if (modeRequiresGPS() && hasGPS) {
@@ -203,9 +228,9 @@ void loop() {
             } else {
                 isMaster = false;
             }
-            setLEDColorForMode(mode); // Update LED state for the new mode
+            setLEDColorForMode(mode);
             syncMode();
-            delay(200); // Debounce delay
+            delay(200);
         }
     }
 
@@ -227,40 +252,105 @@ void loop() {
         debugOutput();
     }
     // Apply LED effects
-    delay(20);
-    applyEffectToStrip();
+    //applyEffectToStrip();
 }
 
 void sendData() {
-    if (hasGPS) {
-        GPSData gpsData = { 
-            .currentSpeed = static_cast<uint16_t>(currentSpeed * 10), 
-            .currentDirection = static_cast<int16_t>(currentDirection * 10), 
-            .currentElevation = static_cast<int16_t>(currentElevation) 
-        };
-        esp_err_t result = esp_now_send(oppositeMac, (uint8_t *)&gpsData, sizeof(gpsData));
-        if (result != ESP_OK && isDebugFunctionEnabled("MEMORY_SYNC")) {
-            Serial.println("GPS send failed.");
-        } else if(isDebugFunctionEnabled("MEMORY_SYNC")) {
-            Serial.println("GPS data sent successfully.");
-        }
+    if (pairedDevices.empty()) {
+        Serial.println("No peers available to send data.");
+        delay(500);
+        return;
     }
 
-    if (hasMPU) {
-        MPUData mpuData = { 
-            .accelX = static_cast<int16_t>(accelX * 1000), 
-            .accelY = static_cast<int16_t>(accelY * 1000), 
-            .accelZ = static_cast<int16_t>(accelZ * 1000),
-            .gyroX = static_cast<int16_t>(gyroX * 10), 
-            .gyroY = static_cast<int16_t>(gyroY * 10), 
-            .gyroZ = static_cast<int16_t>(gyroZ * 10) 
-        };
-        esp_err_t result = esp_now_send(oppositeMac, (uint8_t *)&mpuData, sizeof(mpuData));
-        if (result != ESP_OK && isDebugFunctionEnabled("MEMORY_SYNC")) {
-            Serial.println("MPU send failed.");
-        } else if (isDebugFunctionEnabled("MEMORY_SYNC")) {
-            Serial.println("MPU data sent successfully.");
+    static GPSData lastGPSData = {};
+    static MPUData lastMPUData = {};
+    const unsigned long baseSendInterval = 300; // Base interval in milliseconds
+    const unsigned long staggerOffset = isMaster ? 0 : 150; // Master sends first
+    static unsigned long lastSendTime = 0;
+
+    if ((millis() - lastSendTime) < (baseSendInterval + staggerOffset)) {
+        return; // Skip sending to avoid collision
+    }
+    lastSendTime = millis();
+
+    // Iterate through paired devices
+    for (const auto &peer : pairedDevices) {
+        // Validate peer exists
+        if (!esp_now_is_peer_exist(peer.data())) {
+            Serial.printf("Peer not found: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                          peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+            continue;
         }
+
+        // Send GPS Data
+        if (hasGPS) {
+            GPSData currentGPSData = gpsData;
+            if (memcmp(&currentGPSData, &lastGPSData, sizeof(GPSData)) != 0) {
+                esp_err_t result = esp_now_send(peer.data(), (uint8_t *)&currentGPSData, sizeof(currentGPSData));
+                if (result == ESP_OK) {
+                    memcpy(&lastGPSData, &currentGPSData, sizeof(GPSData));
+                    Serial.println("GPS data sent successfully.");
+                } else {
+                    Serial.printf("Error sending GPS data to %02X:%02X:%02X:%02X:%02X:%02X: %s\n",
+                                  peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], esp_err_to_name(result));
+                }
+            }
+        }
+
+        // Send MPU Data
+        if (hasMPU) {
+            MPUData currentMPUData = mpuData;
+            if (memcmp(&currentMPUData, &lastMPUData, sizeof(MPUData)) != 0) {
+                esp_err_t result = esp_now_send(peer.data(), (uint8_t *)&currentMPUData, sizeof(currentMPUData));
+                if (result == ESP_OK) {
+                    memcpy(&lastMPUData, &currentMPUData, sizeof(MPUData));
+                    Serial.println("MPU data sent successfully.");
+                } else {
+                    Serial.printf("Error sending MPU data to %02X:%02X:%02X:%02X:%02X:%02X: %s\n",
+                                  peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], esp_err_to_name(result));
+                }
+            }
+        }
+    }
+}
+
+void setupPins() {
+    #ifdef ARDUINO_ESP32_DEV
+        buttonPins =  new int[2] {0, 18}; 
+        numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
+        RXPin = 14;
+        TXPin = 12;
+        Serial.println("Board: ESP32 Dev Module");
+    #elif defined(ARDUINO_ADAFRUIT_QTPY_ESP32S2)
+        buttonPins =  new int[2] {0, 18}; 
+        numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
+        RXPin = 40;
+        TXPin = 41;
+        Serial.println("Board: ESP32-S2");
+    #elif defined(ARDUINO_ADAFRUIT_QTPY_ESP32C3)
+        buttonPins =  new int[2] {9, 18}; 
+        numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
+        RXPin = 5;
+        TXPin = 6;
+        Serial.println("Board: ESP32-C3");
+    #elif defined(ARDUINO_ESP32_THING)
+        buttonPins =  new int[2] {0, 18}; 
+        numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
+        RXPin = 15;
+        TXPin = 2;
+        Serial.println("Board: SparkFun ESP32 Thing");
+    #else
+        buttonPins =  new int[2] {0, 18}; 
+        numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
+        RXPin = 41; // Default fallback
+        TXPin = 40;
+        Serial.println("Board: Unknown, using default pins");
+    #endif
+
+    // Configure button pins as inputs
+    for (int i = 0; i < numberOfButtons; i++) {
+        Serial.printf("Enabling pin %d (GPIO %d)\n", i, buttonPins[i]);
+        pinMode(buttonPins[i], INPUT_PULLUP);
     }
 }
 
@@ -273,40 +363,55 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-    if(isDebugFunctionEnabled("MEMORY_SYNC")){
-        Serial.printf("Received data from: %02X:%02X:%02X:%02X:%02X:%02X, Length: %d\n",
-                    mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5], len);
-    }
+    if (len == 1 && incomingData[0] == 1) {
+        // Received pairing request
+        Serial.printf("Received pairing request from: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      mac_addr[0], mac_addr[1], mac_addr[2],
+                      mac_addr[3], mac_addr[4], mac_addr[5]);
 
-    if (memcmp(mac_addr, oppositeMac, 6) == 0) {
-        // Process data only if it came from the opposite MAC
-        handleModeSync(mac_addr, incomingData, len);
-        if (len == sizeof(GPSData)) {
-            GPSData *receivedGPS = (GPSData *)incomingData;
-            syncData.gpsData = *receivedGPS;
-            if(isDebugFunctionEnabled("MEMORY_SYNC")){
-                Serial.println("Received GPS Data");
-            }
+        // Add peer if not already added
+        addPeer(mac_addr);
+
+        // Send pairing response
+        uint8_t pairingResponse = 2;
+        esp_err_t result = esp_now_send(mac_addr, &pairingResponse, sizeof(pairingResponse));
+        if (result != ESP_OK) {
+            Serial.printf("Error sending pairing response: %s\n", esp_err_to_name(result));
         }
 
-        if (len == sizeof(MPUData)) {
-            MPUData *receivedMPU = (MPUData *)incomingData;
-            syncData.mpuData = *receivedMPU;
-            if(isDebugFunctionEnabled("MEMORY_SYNC")){
-                Serial.println("Received MPU Data");
+    } else if (len == 1 && incomingData[0] == 2) {
+        // Received pairing response
+        Serial.printf("Received pairing response from: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      mac_addr[0], mac_addr[1], mac_addr[2],
+                      mac_addr[3], mac_addr[4], mac_addr[5]);
+
+        addPeer(mac_addr);
+
+    } else {
+        // Handle sensor data or mode sync if oppositeMac is known and matches mac_addr
+        if (memcmp(mac_addr, oppositeMac, 6) == 0) {
+            handleModeSync(mac_addr, incomingData, len);
+
+            if (!hasGPS && len == sizeof(GPSData)) {
+                GPSData *receivedGPS = (GPSData *)incomingData;
+                gpsData = *receivedGPS;
+            }
+
+            if (!hasMPU && len == sizeof(MPUData)) {
+                MPUData *receivedMPU = (MPUData *)incomingData;
+                mpuData = *receivedMPU;
+                Serial.printf("Received MPU Data: GyroX: %f, GyroY: %f, GyroZ: %f\n", 
+                              mpuData.gyroX, mpuData.gyroY, mpuData.gyroZ);
             }
         }
-    } else if (isDebugFunctionEnabled("MEMORY_SYNC")) {
-            Serial.println("Ignored data from an unknown device.");      
     }
 }
 
 void syncMode() {
-    // Sends the current mode to the opposite device
     esp_err_t result = esp_now_send(oppositeMac, &mode, sizeof(mode));
     if (result != ESP_OK) {
         Serial.println("Failed to send mode sync.");
-    } else {
+    } else {    
         Serial.println("Mode sync sent successfully.");
     }
 }
@@ -345,28 +450,28 @@ void debugOutput() {
 
     lastDebugTime = millis(); // Update the last debug time
 
-    if(hasGPS){
+    if((modeRequiresGPS() || mode == 0)){
         if (isDebugFunctionEnabled("GPS_SPEED")) {
             Serial.print("Speed (mph): ");
-            Serial.println(currentSpeed);
+            Serial.println(gpsData.currentSpeed);
         } 
         if (isDebugFunctionEnabled("GPS_LOC")) {
             Serial.print("Latitude: ");
-            Serial.println(currentLatitude, 6);
+            Serial.println(gpsData.currentLatitude, 6);
             Serial.print("Longitude: ");
-            Serial.println(currentLongitude, 6);
+            Serial.println(gpsData.currentLongitude, 6);
         } 
         if (isDebugFunctionEnabled("GPS_ELEV")) {
             Serial.print("Elevation (meters): ");
-            Serial.println(currentElevation);
+            Serial.println(gpsData.currentElevation);
         } 
         if (isDebugFunctionEnabled("GPS_SATS")) {
             Serial.print("Satellites: ");
-            Serial.println(gpsSatellites);
+            Serial.println(gpsData.gpsSatellites);
         }
     }
     // gyro functions
-    if(hasMPU){
+    if((modeRequiresMPU() || mode == 0)){
         if (isDebugFunctionEnabled("GYRO_XYZ")) {
             sensors_event_t a, g, temp;
             mpu.getEvent(&a, &g, &temp);
@@ -392,53 +497,34 @@ void debugOutput() {
 
 // --- GPS ---
 void readGPSData() {
-    bool dataUpdated = false; // Flag to track if any GPS data has been updated
-
     while (gpsSerial.available() > 0) {
         char c = gpsSerial.read();
-        gps.encode(c); // Feed the GPS library with the received data
+        gps.encode(c); // Feed TinyGPS++ library
 
-        // Check and update individual data points
         if (gps.location.isUpdated()) {
-            currentLatitude = gps.location.lat();
-            currentLongitude = gps.location.lng();
-            dataUpdated = true;
+            gpsData.currentLatitude = gps.location.lat();
+            gpsData.currentLongitude = gps.location.lng();
         }
         if (gps.altitude.isUpdated()) {
-            currentElevation = gps.altitude.meters();
-            dataUpdated = true;
+            gpsData.currentElevation = gps.altitude.meters();
         }
         if (gps.speed.isUpdated()) {
-            currentSpeed = gps.speed.mph() > 0.5 ? gps.speed.mph() : 0.0;
-            dataUpdated = true;
+            gpsData.currentSpeed = gps.speed.mph() > 0.5 ? gps.speed.mph() : 0.0;
         }
         if (gps.satellites.isUpdated()) {
-            gpsSatellites = gps.satellites.value();
-            dataUpdated = true;
+            gpsData.gpsSatellites = gps.satellites.value();
         }
         if (gps.hdop.isUpdated()) {
-            gpsHDOP = gps.hdop.value();
-            dataUpdated = true;
+            gpsData.gpsHDOP = gps.hdop.value();
         }
-    }
-
-    // Output default values if no data has been updated
-    if (!dataUpdated) {
-        currentLatitude = 0.0;
-        currentLongitude = 0.0;
-        currentElevation = 0.0;
-        currentSpeed = 0.0;
-        gpsSatellites = 0;
-        gpsHDOP = 0.0;
     }
 }
 
 void initializeGPS() {
     Serial.println("Initializing GPS...");
     hasGPS = false; // Assume GPS is not present initially
-
+    gpsSerial.setRxBufferSize(1024);
     gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
-
     unsigned long startTime = millis();
     gpsSerial.flush(); // Clear any residual data in the serial buffer
 
@@ -478,21 +564,16 @@ void initializeMPU() {
 
 // --- MPU ---
 void readGyroData() {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    sensors_event_t accel, gyro, temp;
+    mpu.getEvent(&accel, &gyro, &temp);
 
-    // Ensure we are capturing gyro values in degrees per second
-    currentDirection = g.gyro.z; // Convert radians to degrees
-
-    // Update accelerometer data
-    accelX = a.acceleration.x;
-    accelY = a.acceleration.y;
-    accelZ = a.acceleration.z;
-
-    // Update gyroscope data
-    gyroX = g.gyro.x * 57.2958; // Convert radians to degrees
-    gyroY = g.gyro.y * 57.2958;
-    gyroZ = g.gyro.z * 57.2958;
+    mpuData.currentDirection = gyro.gyro.z * 57.2958; // Convert radians to degrees
+    mpuData.accelX = accel.acceleration.x * 1000; // Scale to milli-g
+    mpuData.accelY = accel.acceleration.y * 1000;
+    mpuData.accelZ = accel.acceleration.z * 1000;
+    mpuData.gyroX = gyro.gyro.x * 57.2958; // Convert radians to degrees/sec
+    mpuData.gyroY = gyro.gyro.y * 57.2958;
+    mpuData.gyroZ = gyro.gyro.z * 57.2958;
 }
 
 // --- LED Effects ---
@@ -530,7 +611,7 @@ void setLEDColorForMode(uint8_t mode) {
 }
 
 void scrollingRainbow() {
-    uint16_t speedFactor = map(constrain(currentSpeed, 0, 20), 0, 20, 5, 100);
+    uint16_t speedFactor = map(constrain(gpsData.currentSpeed, 0, 20), 0, 20, 5, 100);
     for (int i = 0; i < NUM_LEDS; i++) {
         uint32_t color = strip.ColorHSV((hue + (i * 65536L / NUM_LEDS)) % 65536, 255, 255);
         strip.setPixelColor(i, color);
@@ -540,7 +621,7 @@ void scrollingRainbow() {
 }
 
 void directionalStrobe() {
-    uint16_t strobeInterval = map(abs(currentDirection), 0, 180, 100, 10);
+    uint16_t strobeInterval = map(abs(mpuData.currentDirection), 0, 180, 100, 10);
     static uint32_t lastUpdate = 0;
 
     if (millis() - lastUpdate > strobeInterval) {
@@ -555,7 +636,7 @@ void directionalStrobe() {
 
 void cometTail() {
     static int cometPos = 0;
-    uint16_t tailLength = map(currentSpeed, 0, 20, 5, 20);
+    uint16_t tailLength = map(gpsData.currentSpeed, 0, 20, 5, 20);
 
     for (int i = 0; i < NUM_LEDS; i++) {
         if (i == cometPos) {
@@ -571,7 +652,7 @@ void cometTail() {
 }
 
 void twinkleBurst() {
-    uint8_t chanceOfTwinkle = map(abs(currentDirection), 0, 180, 10, 100);
+    uint8_t chanceOfTwinkle = map(abs(mpuData.currentDirection), 0, 180, 10, 100);
     strip.clear();
 
     for (int i = 0; i < NUM_LEDS; i++) {
@@ -585,7 +666,7 @@ void breathingEffect() {
     static uint16_t brightness = 0;
     static int direction = 1;
 
-    uint16_t breathInterval = map(currentSpeed, 0, 20, 50, 10);
+    uint16_t breathInterval = map(gpsData.currentSpeed, 0, 20, 50, 10);
     
     brightness += direction * breathInterval;
     if (brightness >= 255) {
@@ -619,6 +700,116 @@ void gyroRainbowEffect() {
         strip.setPixelColor(i, color);
     }
     strip.show();
+}
+
+
+// Add a peer to the list
+void addPeer(const uint8_t *mac_addr) {
+    for (const auto &peer : pairedDevices) {
+        if (memcmp(peer.data(), mac_addr, 6) == 0) {
+            Serial.println("Peer already exists.");
+            return;
+        }
+    }
+
+    std::array<uint8_t, 6> macCopy;
+    memcpy(macCopy.data(), mac_addr, 6);
+    pairedDevices.push_back(macCopy);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, mac_addr, 6);
+    peerInfo.channel = 0; // Default channel
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add peer.");
+    } else {
+        Serial.printf("Peer added: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      mac_addr[0], mac_addr[1], mac_addr[2],
+                      mac_addr[3], mac_addr[4], mac_addr[5]);
+    }
+
+    // Debug paired devices
+    Serial.println("Current paired devices:");
+    for (const auto &peer : pairedDevices) {
+        for (int i = 0; i < 6; i++) {
+            Serial.printf("%02X", peer[i]);
+            if (i < 5) Serial.print(":");
+        }
+        Serial.println();
+    }
+}
+void enterPairingMode(unsigned long duration) {
+    Serial.println("Entering pairing mode...");
+    unsigned long startTime = millis();
+    isPairingMode = true;
+
+    bool ledState = false;
+    unsigned long lastBlinkTime = 0;
+    const unsigned long blinkInterval = 500;
+    unsigned long lastPairingRequestTime = 0;
+
+    while (millis() - startTime < duration) {
+        // Blink LED to indicate pairing mode
+        if (millis() - lastBlinkTime >= blinkInterval) {
+            lastBlinkTime = millis();
+            ledState = !ledState;
+            #ifdef PIN_NEOPIXEL
+            builtInLED.setPixelColor(0, ledState ? builtInLED.Color(255, 0, 0) : builtInLED.Color(0, 0, 0));
+            builtInLED.show();
+            #endif
+        }
+
+        // Send a pairing request every second
+        if (millis() - lastPairingRequestTime >= 1000) {
+            lastPairingRequestTime = millis();
+            sendPairingRequest();
+        }
+
+        // If we’ve reached max peers or found at least one peer, we can break early
+        if (!pairedDevices.empty() && pairedDevices.size() >= MAX_PEERS) {
+            Serial.println("Max peers reached or at least one peer found. Exiting pairing mode.");
+            break;
+        }
+
+        // Yield to allow background tasks (including ESP-NOW callbacks) to run
+        delay(10);
+    }
+
+    isPairingMode = false;
+
+    #ifdef PIN_NEOPIXEL
+    builtInLED.clear();
+    builtInLED.show();
+    #endif
+
+    if (!pairedDevices.empty()) {
+        Serial.println("Pairing complete. Paired devices:");
+        for (const auto &peer : pairedDevices) {
+            for (int i = 0; i < 6; i++) {
+                Serial.printf("%02X", peer[i]);
+                if (i < 5) Serial.print(":");
+            }
+            Serial.println();
+        }
+
+        // Set the oppositeMac as the first paired device (if you have only one peer)
+        memcpy(oppositeMac, pairedDevices[0].data(), 6);
+
+    } else {
+        Serial.println("Pairing mode timed out. No devices paired.");
+    }
+}
+
+void sendPairingRequest() {
+    uint8_t pairingSignal = 1; // '1' indicates a pairing request
+    uint8_t broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_err_t result = esp_now_send(broadcastAddress, &pairingSignal, sizeof(pairingSignal));
+    if (result == ESP_OK) {
+        Serial.println("Pairing request broadcast sent successfully.");
+    } else {
+        Serial.printf("Error sending pairing request broadcast: %s\n", esp_err_to_name(result));
+    }
 }
 
 // --- Mode Requirements ---
