@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <TinyGPSPlus.h>
@@ -13,25 +14,32 @@
 #include <vector>
 #include <array>
 
-// Dynamic list of peers
-std::vector<std::array<uint8_t, 6>> pairedDevices;
+// do you want to synthesize sensors
+// #define MOCK_SENSORS true
 
 // Pin and hardware definitions
 #define DATA_PIN 17
 #define NUM_LEDS 50
 #define DEBUG_MODE true
-#define MAX_PEERS 1
-#define PAIRING_SECONDS 25
+
+// If we are mocking, we won't rely on hardware
+#ifdef MOCK_SENSORS
+bool hasGPS = true;
+bool hasMPU = true;
+#else
+bool hasGPS = false;
+bool hasMPU = false;
+#endif
 
 // List debug functions and their enabled status
 std::unordered_map<std::string, bool> debugFunctions = {
     {"GPS_SPEED", false},
     {"GPS_LOC", false},
-    {"GPS_ELEV", false},
+    {"GPS_ELEV", true},
     {"GPS_SATS", true},
     {"GYRO_XYZ", true},
     {"GYRO_ACCEL", false},
-    {"MEMORY_SYNC", true}
+    {"MEMORY_SYNC", false}
 };
 
 int* buttonPins; // to-do, make this a flexible sized array
@@ -53,11 +61,8 @@ unsigned long lastGPSUpdate = 0;
 const unsigned long gpsUpdateInterval = 1000; // Update GPS every 1000 ms
 uint8_t mode = 0;
 uint16_t hue = 0;
-bool hasGPS = false;
-bool hasMPU = false;
 bool isMaster = false;
 bool modeSyncInProgress = false;
-bool isPairingMode = true; // Flag for pairing mode
 
 // NeoPixel and ESP-NOW structures
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
@@ -89,6 +94,7 @@ typedef struct __attribute__((packed)) {
 
 GPSData gpsData;
 MPUData mpuData;
+
 const unsigned long debounceDelay = 50; // 50 ms debounce time
 /*
 // Array of peer MAC addresses (replace with actual MAC addresses of devices)
@@ -104,8 +110,10 @@ uint8_t macAddresses[][6] = {
 // A0:76:4E:14:6A:F4
 // 34:85:18:18:25:74
 
-uint8_t selfMac[6];      // This device's MAC address
-uint8_t oppositeMac[6];  // The opposite device's MAC address
+// use a fixed mac address for all devices in the cloud
+uint8_t trueMAC[6];
+uint8_t newMACAddress[] = {0x6F, 0x1A, 0xA4, 0x07, 0x0D, 0x66};
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 esp_now_peer_info_t peerInfo;
 
@@ -153,68 +161,59 @@ bool modeRequiresGPS();
 bool modeRequiresMPU();
 void sendPairingRequest();
 void enterPairingMode(unsigned long duration = 15000); 
-void addPeer(const uint8_t *mac_addr);
+void addPeer();
 
 void setup() {
     Serial.begin(115200);
 
     // Sensor setup
     setupPins();
-    initializeGPS();
-    if (!hasGPS) {
-        initializeMPU();
-    }
 
-    Serial.begin(115200);
 
-    WiFi.mode(WIFI_STA);
-    WiFi.macAddress(selfMac);
-    Serial.printf("Self MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                  selfMac[0], selfMac[1], selfMac[2], selfMac[3], selfMac[4], selfMac[5]);
+    #ifndef MOCK_SENSORS
+        initializeGPS();
+        if (!hasGPS) {
+            initializeMPU();
+        }
+    #else
+        Serial.println("Mock mode enabled: Not initializing real sensors.");
+        // Just set them as 'detected'
+        hasGPS = true;
+        hasMPU = true;
+    #endif
+
+    WiFi.mode(WIFI_MODE_STA);
+    Serial.print("[OLD] ESP32 Board MAC Address:  ");
+    Serial.println(WiFi.macAddress());
+    esp_wifi_set_mac(WIFI_IF_STA, &newMACAddress[0]);
+    Serial.print("[NEW] ESP32 Board MAC Address:  ");
+    Serial.println(WiFi.macAddress());
+
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
         return;
     }
 
-    esp_now_register_recv_cb(onDataRecv);
+    // register send callback
+    esp_now_register_send_cb(onDataSent);
 
-    uint8_t broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    esp_now_peer_info_t broadcastPeer = {};
-    memset(broadcastPeer.peer_addr, 0xFF, 6);
-    broadcastPeer.channel = 0;
-    broadcastPeer.encrypt = false;
-    if (esp_now_add_peer(&broadcastPeer) != ESP_OK) {
-        Serial.println("Failed to add broadcast peer.");
-    }
+    // setup peers
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
 
-    enterPairingMode(PAIRING_SECONDS*1000);
-
-    // If no peers found, indicate and exit
-    if (pairedDevices.empty()) {
-        Serial.println("No peers found. Running in standalone mode.");
+    // Add peer
+    if (esp_now_add_peer(&peerInfo) != ESP_OK){
+        Serial.println("Error adding peer");
         return;
     }
 
-    // Add opposite peer if pairing was successful
-    memcpy(peerInfo.peer_addr, pairedDevices[0].data(), 6);
-    peerInfo.channel = 0; // Default channel
-    peerInfo.encrypt = false;
-
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("Failed to add opposite peer.");
-    } else {
-        Serial.println("Opposite peer added successfully.");
-    }
-
-    esp_now_register_send_cb(onDataSent);
+    // register recv callback
+    esp_now_register_recv_cb(onDataRecv);
 }
 
 void loop() {
-    // stubbed off while pairing
-    if (isPairingMode){
-        return;
-    }
     // Check all button pins
     for (int i = 0; i < numberOfButtons; i++) {
         if (digitalRead(buttonPins[i]) == LOW) {
@@ -230,38 +229,53 @@ void loop() {
             }
             setLEDColorForMode(mode);
             syncMode();
+            // debounce
             delay(200);
         }
     }
 
-    // Process GPS if available
-    if (hasGPS) {
-        readGPSData();
-    }
+    // If mocking, produce fake data instead of reading real sensors
+    #ifdef MOCK_SENSORS
+        // Generate some pseudo-random or fixed test data
+        gpsData.currentLatitude = 37.7749;     // Example: San Francisco lat
+        gpsData.currentLongitude = -122.4194; // Example: San Francisco lon
+        gpsData.currentSpeed = 10.5;          // Example speed in mph
+        gpsData.currentElevation = 30.0;      // 30 meters elevation
+        gpsData.gpsSatellites = 8;
+        gpsData.gpsHDOP = 1.0;
 
-    // Process MPU if available
-    if (hasMPU) {
-        readGyroData();
-    }
+        mpuData.currentDirection = 90.0; // Facing East
+        mpuData.accelX = 0;
+        mpuData.accelY = 0;
+        mpuData.accelZ = 1000;    // 1G upward
+        mpuData.gyroX = 0;
+        mpuData.gyroY = 0;
+        mpuData.gyroZ = 0;
+
+        // Since sensors are mocked, you can skip calling readGPSData or readGyroData
+    #else
+        // If not mocking, read the real sensors
+        if (hasGPS) {
+            readGPSData();
+        }
+        if (hasMPU) {
+            readGyroData();
+        }
+    #endif
 
     // Call sendData 
-    sendData();
+     sendData();
 
     // Debug output
     if (DEBUG_MODE) {
         debugOutput();
     }
     // Apply LED effects
-    //applyEffectToStrip();
+    applyEffectToStrip();
 }
 
 void sendData() {
-    if (pairedDevices.empty()) {
-        Serial.println("No peers available to send data.");
-        delay(500);
-        return;
-    }
-
+    // Serial.println("Sending Data");
     static GPSData lastGPSData = {};
     static MPUData lastMPUData = {};
     const unsigned long baseSendInterval = 300; // Base interval in milliseconds
@@ -273,44 +287,42 @@ void sendData() {
     }
     lastSendTime = millis();
 
-    // Iterate through paired devices
-    for (const auto &peer : pairedDevices) {
-        // Validate peer exists
-        if (!esp_now_is_peer_exist(peer.data())) {
-            Serial.printf("Peer not found: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                          peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
-            continue;
-        }
+    // Send GPS Data
+    if (hasGPS) {
+        GPSData currentGPSData = gpsData;
 
-        // Send GPS Data
-        if (hasGPS) {
-            GPSData currentGPSData = gpsData;
-            if (memcmp(&currentGPSData, &lastGPSData, sizeof(GPSData)) != 0) {
-                esp_err_t result = esp_now_send(peer.data(), (uint8_t *)&currentGPSData, sizeof(currentGPSData));
-                if (result == ESP_OK) {
-                    memcpy(&lastGPSData, &currentGPSData, sizeof(GPSData));
+        // Check if the current GPS data differs from the last GPS data sent
+        if (memcmp(&currentGPSData, &lastGPSData, sizeof(GPSData)) != 0) {
+            esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&currentGPSData, sizeof(currentGPSData));
+if (result == ESP_OK) {
+                memcpy(&lastGPSData, &currentGPSData, sizeof(GPSData));
+                if(isDebugFunctionEnabled("MEMORY_SYNC")){
                     Serial.println("GPS data sent successfully.");
-                } else {
-                    Serial.printf("Error sending GPS data to %02X:%02X:%02X:%02X:%02X:%02X: %s\n",
-                                  peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], esp_err_to_name(result));
                 }
+            } else {
+                Serial.println("Error sending GPS data.");
             }
         }
+        // If data hasn't changed, don't send.
+    }
 
-        // Send MPU Data
-        if (hasMPU) {
-            MPUData currentMPUData = mpuData;
-            if (memcmp(&currentMPUData, &lastMPUData, sizeof(MPUData)) != 0) {
-                esp_err_t result = esp_now_send(peer.data(), (uint8_t *)&currentMPUData, sizeof(currentMPUData));
-                if (result == ESP_OK) {
-                    memcpy(&lastMPUData, &currentMPUData, sizeof(MPUData));
+    // symc MPU data if necessary
+    if (hasMPU) {
+        MPUData currentMPUData = mpuData;
+
+        // Check if the current MPU data is different from the last sent data
+        if (memcmp(&currentMPUData, &lastMPUData, sizeof(MPUData)) != 0) {
+            esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&currentMPUData, sizeof(currentMPUData));
+            if (result == ESP_OK) {
+                memcpy(&lastMPUData, &currentMPUData, sizeof(MPUData));
+                if(isDebugFunctionEnabled("MEMORY_SYNC")){
                     Serial.println("MPU data sent successfully.");
-                } else {
-                    Serial.printf("Error sending MPU data to %02X:%02X:%02X:%02X:%02X:%02X: %s\n",
-                                  peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], esp_err_to_name(result));
                 }
+            } else {
+                Serial.println("Error sending MPU data.");
             }
         }
+        // If the data hasn't changed, do nothing
     }
 }
 
@@ -324,8 +336,8 @@ void setupPins() {
     #elif defined(ARDUINO_ADAFRUIT_QTPY_ESP32S2)
         buttonPins =  new int[2] {0, 18}; 
         numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
-        RXPin = 40;
-        TXPin = 41;
+        RXPin = 41;
+        TXPin = 40;
         Serial.println("Board: ESP32-S2");
     #elif defined(ARDUINO_ADAFRUIT_QTPY_ESP32C3)
         buttonPins =  new int[2] {9, 18}; 
@@ -362,53 +374,47 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     }
 }
 
-void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-    if (len == 1 && incomingData[0] == 1) {
-        // Received pairing request
-        Serial.printf("Received pairing request from: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                      mac_addr[0], mac_addr[1], mac_addr[2],
-                      mac_addr[3], mac_addr[4], mac_addr[5]);
+// void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+void onDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
 
-        // Add peer if not already added
-        addPeer(mac_addr);
+        const uint8_t *mac_addr = info->src_addr; 
+            // Check if the incoming data size matches the size of 'mode'
+        if (len == sizeof(mode)) {
+            uint8_t receivedMode;
+            memcpy(&receivedMode, incomingData, sizeof(receivedMode));
 
-        // Send pairing response
-        uint8_t pairingResponse = 2;
-        esp_err_t result = esp_now_send(mac_addr, &pairingResponse, sizeof(pairingResponse));
-        if (result != ESP_OK) {
-            Serial.printf("Error sending pairing response: %s\n", esp_err_to_name(result));
+            // If the received mode is different from the current mode, update it
+            if (receivedMode != mode) {
+                mode = receivedMode;
+                Serial.printf("Mode synchronized to: %d\n", mode);
+                setLEDColorForMode(mode);
+            }
+            return; // We've handled the mode update, so just return
         }
 
-    } else if (len == 1 && incomingData[0] == 2) {
-        // Received pairing response
-        Serial.printf("Received pairing response from: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                      mac_addr[0], mac_addr[1], mac_addr[2],
-                      mac_addr[3], mac_addr[4], mac_addr[5]);
-
-        addPeer(mac_addr);
-
-    } else {
-        // Handle sensor data or mode sync if oppositeMac is known and matches mac_addr
-        if (memcmp(mac_addr, oppositeMac, 6) == 0) {
-            handleModeSync(mac_addr, incomingData, len);
-
-            if (!hasGPS && len == sizeof(GPSData)) {
-                GPSData *receivedGPS = (GPSData *)incomingData;
-                gpsData = *receivedGPS;
+        if (!hasGPS && len == sizeof(GPSData)) {
+        //if (len == sizeof(GPSData)) {
+            GPSData *receivedGPS = (GPSData *)incomingData;
+            gpsData = *receivedGPS;
+            if ( isDebugFunctionEnabled("MEMORY_COPY") ) {
+            Serial.printf("Received GPS Data: Lat: %f, Lon: %f, Speed: %f\n",
+                      gpsData.currentLatitude, gpsData.currentLongitude, gpsData.currentSpeed);
             }
-
-            if (!hasMPU && len == sizeof(MPUData)) {
-                MPUData *receivedMPU = (MPUData *)incomingData;
-                mpuData = *receivedMPU;
-                Serial.printf("Received MPU Data: GyroX: %f, GyroY: %f, GyroZ: %f\n", 
+        }
+        if (!hasMPU && len == sizeof(MPUData)) {
+        //if (len == sizeof(MPUData)) {
+            MPUData *receivedMPU = (MPUData *)incomingData;
+            mpuData = *receivedMPU;
+            if ( isDebugFunctionEnabled("MEMORY_COPY") ) {
+              Serial.printf("Received MPU Data: GyroX: %f, GyroY: %f, GyroZ: %f\n", 
                               mpuData.gyroX, mpuData.gyroY, mpuData.gyroZ);
             }
         }
-    }
+    
 }
 
 void syncMode() {
-    esp_err_t result = esp_now_send(oppositeMac, &mode, sizeof(mode));
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&mode, sizeof(mode));
     if (result != ESP_OK) {
         Serial.println("Failed to send mode sync.");
     } else {    
@@ -422,7 +428,7 @@ void handleModeSync(const uint8_t *mac_addr, const uint8_t *incomingData, int le
         uint8_t receivedMode;
         memcpy(&receivedMode, incomingData, sizeof(receivedMode));
         
-        if (memcmp(mac_addr, oppositeMac, 6) == 0) {
+        if (memcmp(mac_addr, broadcastAddress, 6) == 0) {
             mode = receivedMode;
             Serial.printf("Mode synchronized to: %d\n", mode);
             setLEDColorForMode(mode); // Update LED state for the new mode
@@ -700,116 +706,6 @@ void gyroRainbowEffect() {
         strip.setPixelColor(i, color);
     }
     strip.show();
-}
-
-
-// Add a peer to the list
-void addPeer(const uint8_t *mac_addr) {
-    for (const auto &peer : pairedDevices) {
-        if (memcmp(peer.data(), mac_addr, 6) == 0) {
-            Serial.println("Peer already exists.");
-            return;
-        }
-    }
-
-    std::array<uint8_t, 6> macCopy;
-    memcpy(macCopy.data(), mac_addr, 6);
-    pairedDevices.push_back(macCopy);
-
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, mac_addr, 6);
-    peerInfo.channel = 0; // Default channel
-    peerInfo.encrypt = false;
-
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("Failed to add peer.");
-    } else {
-        Serial.printf("Peer added: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                      mac_addr[0], mac_addr[1], mac_addr[2],
-                      mac_addr[3], mac_addr[4], mac_addr[5]);
-    }
-
-    // Debug paired devices
-    Serial.println("Current paired devices:");
-    for (const auto &peer : pairedDevices) {
-        for (int i = 0; i < 6; i++) {
-            Serial.printf("%02X", peer[i]);
-            if (i < 5) Serial.print(":");
-        }
-        Serial.println();
-    }
-}
-void enterPairingMode(unsigned long duration) {
-    Serial.println("Entering pairing mode...");
-    unsigned long startTime = millis();
-    isPairingMode = true;
-
-    bool ledState = false;
-    unsigned long lastBlinkTime = 0;
-    const unsigned long blinkInterval = 500;
-    unsigned long lastPairingRequestTime = 0;
-
-    while (millis() - startTime < duration) {
-        // Blink LED to indicate pairing mode
-        if (millis() - lastBlinkTime >= blinkInterval) {
-            lastBlinkTime = millis();
-            ledState = !ledState;
-            #ifdef PIN_NEOPIXEL
-            builtInLED.setPixelColor(0, ledState ? builtInLED.Color(255, 0, 0) : builtInLED.Color(0, 0, 0));
-            builtInLED.show();
-            #endif
-        }
-
-        // Send a pairing request every second
-        if (millis() - lastPairingRequestTime >= 1000) {
-            lastPairingRequestTime = millis();
-            sendPairingRequest();
-        }
-
-        // If we’ve reached max peers or found at least one peer, we can break early
-        if (!pairedDevices.empty() && pairedDevices.size() >= MAX_PEERS) {
-            Serial.println("Max peers reached or at least one peer found. Exiting pairing mode.");
-            break;
-        }
-
-        // Yield to allow background tasks (including ESP-NOW callbacks) to run
-        delay(10);
-    }
-
-    isPairingMode = false;
-
-    #ifdef PIN_NEOPIXEL
-    builtInLED.clear();
-    builtInLED.show();
-    #endif
-
-    if (!pairedDevices.empty()) {
-        Serial.println("Pairing complete. Paired devices:");
-        for (const auto &peer : pairedDevices) {
-            for (int i = 0; i < 6; i++) {
-                Serial.printf("%02X", peer[i]);
-                if (i < 5) Serial.print(":");
-            }
-            Serial.println();
-        }
-
-        // Set the oppositeMac as the first paired device (if you have only one peer)
-        memcpy(oppositeMac, pairedDevices[0].data(), 6);
-
-    } else {
-        Serial.println("Pairing mode timed out. No devices paired.");
-    }
-}
-
-void sendPairingRequest() {
-    uint8_t pairingSignal = 1; // '1' indicates a pairing request
-    uint8_t broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    esp_err_t result = esp_now_send(broadcastAddress, &pairingSignal, sizeof(pairingSignal));
-    if (result == ESP_OK) {
-        Serial.println("Pairing request broadcast sent successfully.");
-    } else {
-        Serial.printf("Error sending pairing request broadcast: %s\n", esp_err_to_name(result));
-    }
 }
 
 // --- Mode Requirements ---
