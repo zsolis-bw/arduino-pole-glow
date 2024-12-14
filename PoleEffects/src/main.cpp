@@ -4,7 +4,8 @@
 #include <esp_wifi.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <TinyGPSPlus.h>
+#include <TinyGPSPlus.h> // to-do: move to Adafruit_GPS
+// #include <Adafruit_GPS.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include "esp_log.h"
@@ -33,10 +34,11 @@ bool hasMPU = false;
 
 // List debug functions and their enabled status
 std::unordered_map<std::string, bool> debugFunctions = {
-    {"GPS_SPEED", false},
-    {"GPS_LOC", false},
+    {"GPS_SPEED", true},
+    {"GPS_LOC", true},
     {"GPS_ELEV", true},
     {"GPS_SATS", true},
+    {"GPS_RAW", false},
     {"GYRO_XYZ", true},
     {"GYRO_ACCEL", false},
     {"MEMORY_SYNC", false}
@@ -52,9 +54,10 @@ int TXPin;  // GPS RX -> ESP TX
 #define GPSBaud 38400
 
 // GPS and MPU objects
-TinyGPSPlus gps;
-HardwareSerial gpsSerial(1); // Use Serial1 for GPS
 Adafruit_MPU6050 mpu;
+TinyGPSPlus gps; // still struggling with the Adafruit lib
+HardwareSerial gpsSerial(1); // Use Serial1 for GPS
+// Adafruit_GPS GPS(&gpsSerial);
 
 // Other variables
 unsigned long lastGPSUpdate = 0;
@@ -162,17 +165,18 @@ bool modeRequiresMPU();
 void sendPairingRequest();
 void enterPairingMode(unsigned long duration = 15000); 
 void addPeer();
+void scanI2CBus();
 
 void setup() {
     Serial.begin(115200);
-
+    delay(2000); // debug needs a sec to show
     // Sensor setup
     setupPins();
 
 
     #ifndef MOCK_SENSORS
         initializeGPS();
-        if (!hasGPS) {
+        if (!hasGPS) { // don't combine MPU and GPS for now
             initializeMPU();
         }
     #else
@@ -212,6 +216,20 @@ void setup() {
     // register recv callback
     esp_now_register_recv_cb(onDataRecv);
 }
+float randomInRange(float min, float max) {
+    return min + (float)rand() / ((float)RAND_MAX / (max - min));
+}
+
+void scanI2CBus() {
+    Serial.println("Scanning I2C bus...");
+    for (byte address = 1; address < 127; ++address) {
+        Wire.beginTransmission(address);
+        if (Wire.endTransmission() == 0) {
+            Serial.print("Found I2C device at address: 0x");
+            Serial.println(address, HEX);
+        }
+    }
+}
 
 void loop() {
     // Check all button pins
@@ -234,23 +252,36 @@ void loop() {
         }
     }
 
-    // If mocking, produce fake data instead of reading real sensors
+        // Generate some pseudo-random or fixed test data
     #ifdef MOCK_SENSORS
         // Generate some pseudo-random or fixed test data
-        gpsData.currentLatitude = 37.7749;     // Example: San Francisco lat
-        gpsData.currentLongitude = -122.4194; // Example: San Francisco lon
-        gpsData.currentSpeed = 10.5;          // Example speed in mph
-        gpsData.currentElevation = 30.0;      // 30 meters elevation
-        gpsData.gpsSatellites = 8;
+        // gpsData.currentLatitude = 37.7749;     // Example: San Francisco lat
+        // gpsData.currentLongitude = -122.4194; // Example: San Francisco lon
+        // gpsData.currentSpeed = 10.5;          // Example speed in mph
+        // gpsData.currentElevation = 30.0;      // 30 meters elevation
+        // gpsData.gpsSatellites = 8;
+        // gpsData.gpsHDOP = 1.0;
+        //// Randomising the mock data (Saad) 
+        gpsData.currentLatitude = randomInRange(-90.0, 90.0);
+        gpsData.currentLongitude = randomInRange(-180.0, 180.0);
+        gpsData.currentSpeed = randomInRange(0.0, 20.0); // Speed in mph
+        gpsData.currentElevation = randomInRange(2500, 4000);    
+        gpsData.gpsSatellites = randomInRange(0, 10);
         gpsData.gpsHDOP = 1.0;
-
+        // mpuData.currentDirection = 90.0; // Facing East
+        // mpuData.accelX = 0;
+        // mpuData.accelY = 0;
+        // mpuData.accelZ = 1000;    // 1G upward
+        // mpuData.gyroX = 0;
+        // mpuData.gyroY = 0;
+        // mpuData.gyroZ = 0;
         mpuData.currentDirection = 90.0; // Facing East
-        mpuData.accelX = 0;
-        mpuData.accelY = 0;
-        mpuData.accelZ = 1000;    // 1G upward
-        mpuData.gyroX = 0;
-        mpuData.gyroY = 0;
-        mpuData.gyroZ = 0;
+        mpuData.accelX = randomInRange(-2000, 2000);      // Acceleration in milli-g
+        mpuData.accelY = randomInRange(-2000, 2000);
+        mpuData.accelZ = randomInRange(10, 100);    // 1G upward        
+        mpuData.gyroX = randomInRange(-150, 250);
+        mpuData.gyroY = randomInRange(15, 250);
+        mpuData.gyroZ = randomInRange(15, 250);
 
         // Since sensors are mocked, you can skip calling readGPSData or readGyroData
     #else
@@ -374,10 +405,11 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     }
 }
 
-// void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-void onDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+// Arduiono IDE compatible version
+// void onDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
+        //const uint8_t *mac_addr = info->src_addr; 
 
-        const uint8_t *mac_addr = info->src_addr; 
             // Check if the incoming data size matches the size of 'mode'
         if (len == sizeof(mode)) {
             uint8_t receivedMode;
@@ -552,18 +584,16 @@ void initializeGPS() {
 }
 
 void initializeMPU() {
-      // I2C bus setup
-    Wire.begin(RXPin, TXPin); // Set SDA to GPIO 41 and SCL to GPIO 40
     Serial.println("Initializing MPU...");
-    // Optional: I2C scan for debugging
-    if (mpu.begin()) {
+    Wire.begin(RXPin, TXPin); // Ensure correct SDA and SCL pins
+    if (mpu.begin(0x68)) { // Use 0x68 or 0x69 based on your I2C scan
         hasMPU = true;
         mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
         mpu.setGyroRange(MPU6050_RANGE_500_DEG);
         mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
         Serial.println("MPU6050 initialized successfully.");
     } else {
-        Serial.println("Failed to initialize MPU6050.");
+        Serial.println("Failed to initialize MPU6050. Check connections and address.");
         hasMPU = false;
     }
 }
