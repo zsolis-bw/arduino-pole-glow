@@ -15,7 +15,7 @@
 #include <vector>
 #include <array>
 
-// do you want to synthesize sensors
+// uncomment for mock sensor data
 // #define MOCK_SENSORS true
 
 // Pin and hardware definitions
@@ -93,25 +93,13 @@ typedef struct __attribute__((packed)) {
     float gyroX;           // Scaled to tenths of degrees/sec
     float gyroY;           // Scaled to tenths of degrees/sec
     float gyroZ;           // Scaled to tenths of degrees/sec
+    float test; // to-do : find better way to check object types
 } MPUData;
 
 GPSData gpsData;
 MPUData mpuData;
 
 const unsigned long debounceDelay = 50; // 50 ms debounce time
-/*
-// Array of peer MAC addresses (replace with actual MAC addresses of devices)
-uint8_t macAddresses[][6] = {
-    //{0xD4, 0xF9, 0x8D, 0x66, 0x12, 0xCA}, // Replace with your first ESP32 MAC
-    //{0xF4, 0x12, 0xFA, 0x59, 0x5B, 0x30},  // Replace with your second ESP32 MAC, // Replace with your first ESP32 MAC
-    //{0xC8, 0xF0, 0x9E, 0xA8, 0x39, 0xF4}  // dev board
-    {0xA0, 0x76, 0x4E, 0x14, 0x6A, 0xF4},
-    {0x34, 0x85, 0x18, 0x18, 0x25, 0x74}
-};
-*/
-// C3 macs
-// A0:76:4E:14:6A:F4
-// 34:85:18:18:25:74
 
 // use a fixed mac address for all devices in the cloud
 uint8_t trueMAC[6];
@@ -120,25 +108,6 @@ uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 esp_now_peer_info_t peerInfo;
 
-/*
-void initializePeers() {
-    for (int i = 0; i < sizeof(macAddresses) / sizeof(macAddresses[0]); i++) {
-        memcpy(peerInfo.peer_addr, macAddresses[i], 6);
-        peerInfo.channel = 0; // Use default channel
-        peerInfo.encrypt = false; // No encryption for now
-
-        if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-            Serial.printf("Failed to add peer: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                          macAddresses[i][0], macAddresses[i][1], macAddresses[i][2],
-                          macAddresses[i][3], macAddresses[i][4], macAddresses[i][5]);
-        } else {
-            Serial.printf("Added peer: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                          macAddresses[i][0], macAddresses[i][1], macAddresses[i][2],
-                          macAddresses[i][3], macAddresses[i][4], macAddresses[i][5]);
-        }
-    }
-}
-*/
 // Forward declarations
 void debugOutput();
 bool isDebugFunctionEnabled(const std::string& functionName);
@@ -254,27 +223,14 @@ void loop() {
 
         // Generate some pseudo-random or fixed test data
     #ifdef MOCK_SENSORS
-        // Generate some pseudo-random or fixed test data
-        // gpsData.currentLatitude = 37.7749;     // Example: San Francisco lat
-        // gpsData.currentLongitude = -122.4194; // Example: San Francisco lon
-        // gpsData.currentSpeed = 10.5;          // Example speed in mph
-        // gpsData.currentElevation = 30.0;      // 30 meters elevation
-        // gpsData.gpsSatellites = 8;
-        // gpsData.gpsHDOP = 1.0;
-        //// Randomising the mock data (Saad) 
+
         gpsData.currentLatitude = randomInRange(-90.0, 90.0);
         gpsData.currentLongitude = randomInRange(-180.0, 180.0);
         gpsData.currentSpeed = randomInRange(0.0, 20.0); // Speed in mph
         gpsData.currentElevation = randomInRange(2500, 4000);    
         gpsData.gpsSatellites = randomInRange(0, 10);
         gpsData.gpsHDOP = 1.0;
-        // mpuData.currentDirection = 90.0; // Facing East
-        // mpuData.accelX = 0;
-        // mpuData.accelY = 0;
-        // mpuData.accelZ = 1000;    // 1G upward
-        // mpuData.gyroX = 0;
-        // mpuData.gyroY = 0;
-        // mpuData.gyroZ = 0;
+
         mpuData.currentDirection = 90.0; // Facing East
         mpuData.accelX = randomInRange(-2000, 2000);      // Acceleration in milli-g
         mpuData.accelY = randomInRange(-2000, 2000);
@@ -383,7 +339,7 @@ void setupPins() {
         TXPin = 2;
         Serial.println("Board: SparkFun ESP32 Thing");
     #else
-        buttonPins =  new int[2] {0, 18}; 
+        buttonPins =  new int[2] {19}; 
         numberOfButtons = sizeof(buttonPins) / sizeof(buttonPins[0]);
         RXPin = 41; // Default fallback
         TXPin = 40;
@@ -441,8 +397,12 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
               Serial.printf("Received MPU Data: GyroX: %f, GyroY: %f, GyroZ: %f\n", 
                               mpuData.gyroX, mpuData.gyroY, mpuData.gyroZ);
             }
-        }
-    
+        }    
+
+    if ( isDebugFunctionEnabled("MEMORY_COPY") ) {
+        Serial.printf("Received MPU Data: GyroX: %f, GyroY: %f, GyroZ: %f\n", 
+                        mpuData.gyroX, mpuData.gyroY, mpuData.gyroZ);
+    }
 }
 
 void syncMode() {
@@ -511,24 +471,24 @@ void debugOutput() {
     // gyro functions
     if((modeRequiresMPU() || mode == 0)){
         if (isDebugFunctionEnabled("GYRO_XYZ")) {
-            sensors_event_t a, g, temp;
-            mpu.getEvent(&a, &g, &temp);
+            //sensors_event_t a, g, temp;
+            //mpu.getEvent(&a, &g, &temp);
             Serial.print("Gyro X: ");
-            Serial.print(g.gyro.x);
+            Serial.print(mpuData.gyroX);
             Serial.print(" rad/s, Y: ");
-            Serial.print(g.gyro.y);
+            Serial.print(mpuData.gyroY);
             Serial.print(" rad/s, Z: ");
-            Serial.println(g.gyro.z);
+            Serial.println(mpuData.gyroZ);
         } 
         if (isDebugFunctionEnabled("GYRO_ACCEL")) {
-            sensors_event_t a, g, temp;
-            mpu.getEvent(&a, &g, &temp);
+            //sensors_event_t a, g, temp;
+            //mpu.getEvent(&a, &g, &temp);
             Serial.print("Accel X: ");
-            Serial.print(a.acceleration.x);
+            Serial.print(mpuData.accelX);
             Serial.print(", Y: ");
-            Serial.print(a.acceleration.y);
+            Serial.print(mpuData.accelY);
             Serial.print(", Z: ");
-            Serial.println(a.acceleration.z);
+            Serial.println(mpuData.accelZ);
         } 
     }
 }
@@ -577,6 +537,9 @@ void initializeGPS() {
                 Serial.println("GPS detected and initialized.");
                 return;
             }
+            else {
+                hasGPS = false;
+            }
         }
     }
 
@@ -614,18 +577,16 @@ void readGyroData() {
 
 // --- LED Effects ---
 void applyEffectToStrip() {
-    if (isMaster) {
-        switch (mode) {
-            case 0: strip.clear(); break;
-            case 1: scrollingRainbow(); break;
-            case 2: directionalStrobe(); break;
-            case 3: cometTail(); break;
-            case 4: twinkleBurst(); break;
-            case 5: breathingEffect(); break;
-            case 6: gyroRainbowEffect(); break;
-        }
-        strip.show();
+    switch (mode) {
+        case 0: strip.clear(); break;
+        case 1: scrollingRainbow(); break;
+        case 2: directionalStrobe(); break;
+        case 3: cometTail(); break;
+        case 4: twinkleBurst(); break;
+        case 5: breathingEffect(); break;
+        case 6: gyroRainbowEffect(); break;
     }
+    strip.show();
 }
 
 void setLEDColorForMode(uint8_t mode) {
